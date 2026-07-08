@@ -1,16 +1,21 @@
 import os
 import sys
 import subprocess
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import AIMessage, ToolMessage
+from qareen_embeddings import RemoteEmbeddings
 
-# Ensure API key is present
 if "GROQ_API_KEY" not in os.environ:
-    os.environ["GROQ_API_KEY"] = "[ENCRYPTION_KEY]"
+    print(
+        "Error: GROQ_API_KEY environment variable is not set.\n"
+        "Export it before running Arch-Sage, e.g.:\n"
+        '  export GROQ_API_KEY="your-key-here"\n'
+        "Get a key at https://console.groq.com/keys"
+    )
+    sys.exit(1)
 
 # Color constants
 BLUE = "\033[94m"
@@ -25,8 +30,8 @@ print(f"{BLUE}{BOLD}==================================================")
 print(f"      🧙‍♂️ ARCH-SAGE: AGENTIC SYSTEM TROUBLESHOOTER")
 print(f"=================================================={RESET}")
 
-print(f"{GREEN}[System] Loading embedding model and FAISS vector index...{RESET}")
-embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+print(f"{GREEN}[System] Connecting to local embedding server and loading FAISS vector index...{RESET}")
+embedding_model = RemoteEmbeddings()
 vector_store = FAISS.load_local("arch_wiki_index", embedding_model, allow_dangerous_deserialization=True)
 retriever = vector_store.as_retriever(search_kwargs={"k": 3})
 print(f"{GREEN}[System] Search index loaded! Ready to assist.{RESET}")

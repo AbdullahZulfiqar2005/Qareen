@@ -1,0 +1,23 @@
+# Core RAG / embedding stack
+langchain-huggingface
+langchain-community
+langchain-text-splitters
+langchain-groq
+langchain-core
+langgraph
+faiss-cpu
+sentence-transformers
+
+# Firefox session file decompression (embedding_server.py: /firefox-tabs)
+lz4
+
+# HTTP client used by qareen_embeddings.py (RemoteEmbeddings)
+requests
+
+# Progress bars for the one-time wiki indexing script
+tqdm
+
+# Note: install into a venv, not system-wide:
+#   python -m venv ~/venv
+#   source ~/venv/bin/activate
+#   pip install -r requirements.txt

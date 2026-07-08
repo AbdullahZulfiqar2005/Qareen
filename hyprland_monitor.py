@@ -2,13 +2,18 @@ import os
 import sys
 import time
 import argparse
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
+from qareen_embeddings import RemoteEmbeddings
 
-# Ensure API key is present
 if "GROQ_API_KEY" not in os.environ:
-    os.environ["GROQ_API_KEY"] = "[ENCRYPTION_KEY]"
+    print(
+        "Error: GROQ_API_KEY environment variable is not set.\n"
+        "Export it before running this tool, e.g.:\n"
+        '  export GROQ_API_KEY="your-key-here"\n'
+        "Get a key at https://console.groq.com/keys"
+    )
+    sys.exit(1)
 
 # Color constants
 BLUE = "\033[94m"
@@ -23,11 +28,21 @@ print(f"{BLUE}{BOLD}==================================================")
 print(f"      ❄️  HYPRLAND DIAGNOSTIC & MONITORING AGENT")
 print(f"=================================================={RESET}")
 
+_retriever_cache = None
+
+
 def load_retriever():
-    """Load the FAISS vector index of Arch Wiki."""
-    embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    vector_store = FAISS.load_local("arch_wiki_index", embedding_model, allow_dangerous_deserialization=True)
-    return vector_store.as_retriever(search_kwargs={"k": 3})
+    """Load the FAISS vector index of Arch Wiki, embedding queries via the
+    already-running local embedding server instead of loading a third copy
+    of the transformer model into this process. Cached process-wide since
+    --monitor can trigger analysis many times in one long-running session and
+    reloading the index from disk each time is wasted I/O and CPU."""
+    global _retriever_cache
+    if _retriever_cache is None:
+        embedding_model = RemoteEmbeddings()
+        vector_store = FAISS.load_local("arch_wiki_index", embedding_model, allow_dangerous_deserialization=True)
+        _retriever_cache = vector_store.as_retriever(search_kwargs={"k": 3})
+    return _retriever_cache
 
 def get_hyprland_log():
     """Locate the most recent active Hyprland log or crash report."""
