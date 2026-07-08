@@ -62,7 +62,60 @@ type SimilarityMatch struct {
 	Score float64
 }
 
+// loadDotEnv looks for a .env file (in $QAREEN_ENV_FILE, ~/.config/qareen/.env,
+// ~/.qareen.env, or the current working directory, in that order) and, for
+// every KEY=VALUE line it finds, sets that environment variable if it isn't
+// already set. This means GROQ_API_KEY (and anything else future components
+// need) can just live in a .env file instead of requiring a manual
+// `export GROQ_API_KEY=...` in the shell profile. Lines may optionally start
+// with "export " (as .env.example does) and values may be quoted; comments
+// (#) and blank lines are ignored. Real env vars set in the shell always take
+// priority over the .env file.
+func loadDotEnv() {
+	var candidates []string
+	if v := os.Getenv("QAREEN_ENV_FILE"); v != "" {
+		candidates = append(candidates, v)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".config", "qareen", ".env"))
+		candidates = append(candidates, filepath.Join(home, ".qareen.env"))
+	}
+	candidates = append(candidates, ".env")
+
+	for _, path := range candidates {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			line = strings.TrimPrefix(line, "export ")
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			val = strings.Trim(val, `"'`)
+			if key == "" {
+				continue
+			}
+			if _, exists := os.LookupEnv(key); !exists && val != "" {
+				os.Setenv(key, val)
+			}
+		}
+		// Only the first .env file found is used, mirroring how shell
+		// profiles work (first match wins rather than merging silently).
+		break
+	}
+}
+
 func main() {
+	loadDotEnv()
+
 	if len(os.Args) < 2 {
 		printUsage()
 		return

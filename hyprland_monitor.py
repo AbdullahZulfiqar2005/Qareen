@@ -5,6 +5,9 @@ import argparse
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
 from qareen_embeddings import RemoteEmbeddings
+from qareen_dotenv import load_dotenv
+
+load_dotenv()
 
 if "GROQ_API_KEY" not in os.environ:
     print(

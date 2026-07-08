@@ -298,6 +298,70 @@ function getInstagramContact() {
     return "Instagram User";
 }
 
+// --- STREAMING-SAFE RESPONSE CAPTURE ---
+// Previously, ChatGPT/Gemini/Claude responses were read once via a single
+// fixed setTimeout (1.5-2s) after the response container first appeared.
+// That's a race against the model's own streaming: any answer that takes
+// longer than the fixed delay got logged truncated/mid-sentence, and once
+// logged the node was never re-read, so the final, complete answer was lost
+// forever. This watcher instead observes the response container itself and
+// only fires once its text has stopped changing for `debounceMs` (i.e. the
+// stream has actually finished), with a `maxWaitMs` safety cap so a stalled
+// stream can't hang the watcher indefinitely.
+const _watchedNodes = new WeakSet();
+function watchForStreamCompletion(containerEl, onComplete, { debounceMs = 1200, maxWaitMs = 30000 } = {}) {
+    if (!containerEl || _watchedNodes.has(containerEl)) return;
+    _watchedNodes.add(containerEl);
+
+    const startedAt = Date.now();
+    let debounceTimer = null;
+    let localObserver = null;
+
+    const finish = () => {
+        clearTimeout(debounceTimer);
+        if (localObserver) localObserver.disconnect();
+        onComplete();
+    };
+
+    const scheduleCheck = () => {
+        clearTimeout(debounceTimer);
+        if (Date.now() - startedAt >= maxWaitMs) {
+            finish();
+            return;
+        }
+        debounceTimer = setTimeout(finish, debounceMs);
+    };
+
+    localObserver = new MutationObserver(scheduleCheck);
+    localObserver.observe(containerEl, { childList: true, subtree: true, characterData: true });
+    // Also cover the case where the response is already short/static and no
+    // further mutations ever arrive.
+    scheduleCheck();
+}
+
+// WhatsApp bubbles occasionally get their data-pre-plain-text metadata
+// attribute set slightly *after* the node is inserted (media/caption
+// messages), so relying only on "was this node just added" can miss them.
+// Centralizing the logic lets both the childList and attribute observers
+// share it.
+function handleWhatsAppBubble(msgDiv) {
+    if (!msgDiv || !msgDiv.hasAttribute || !msgDiv.hasAttribute('data-pre-plain-text')) return;
+    const meta = msgDiv.getAttribute('data-pre-plain-text');
+    const match = meta.match(/\]\s*(.*?):\s*$/);
+    if (!match) return;
+
+    let sender = match[1].trim();
+    const isOutgoing = msgDiv.closest('.message-out') !== null || sender.toLowerCase() === "you";
+    if (isOutgoing) sender = "You";
+
+    const textSpan = msgDiv.querySelector('span.selectable-text.copyable-text');
+    if (textSpan) {
+        const text = textSpan.innerText;
+        const chatName = getWhatsAppContact();
+        sendWebLog("whatsapp", chatName, text, sender);
+    }
+}
+
 // MutationObserver for incoming responses & page logs
 const observer = new MutationObserver((mutations) => {
     const host = window.location.hostname;
@@ -308,6 +372,13 @@ const observer = new MutationObserver((mutations) => {
     }
 
     for (const mutation of mutations) {
+        if (mutation.type === 'attributes' && host.includes("web.whatsapp.com")) {
+            if (mutation.attributeName === 'data-pre-plain-text') {
+                handleWhatsAppBubble(mutation.target);
+            }
+            continue;
+        }
+
         if (mutation.type === 'childList') {
             for (const node of mutation.addedNodes) {
                 if (node.nodeType !== Node.ELEMENT_NODE) continue;
@@ -315,22 +386,7 @@ const observer = new MutationObserver((mutations) => {
                 // WhatsApp Messages
                 if (host.includes("web.whatsapp.com")) {
                     const msgDiv = node.classList.contains('copyable-text') ? node : node.querySelector('.copyable-text');
-                    if (msgDiv && msgDiv.hasAttribute('data-pre-plain-text')) {
-                        const meta = msgDiv.getAttribute('data-pre-plain-text');
-                        const match = meta.match(/\]\s*(.*?):\s*$/);
-                        if (match) {
-                            let sender = match[1].trim();
-                            const isOutgoing = msgDiv.closest('.message-out') !== null || sender.toLowerCase() === "you";
-                            if (isOutgoing) sender = "You";
-                            
-                            const textSpan = msgDiv.querySelector('span.selectable-text.copyable-text');
-                            if (textSpan) {
-                                const text = textSpan.innerText;
-                                const chatName = getWhatsAppContact();
-                                sendWebLog("whatsapp", chatName, text, sender);
-                            }
-                        }
-                    }
+                    if (msgDiv) handleWhatsAppBubble(msgDiv);
                 }
                 
                 // ChatGPT Responses
@@ -342,11 +398,11 @@ const observer = new MutationObserver((mutations) => {
                         if (isAssistant) {
                             const textDiv = turn.querySelector('.markdown');
                             if (textDiv) {
-                                setTimeout(() => {
+                                watchForStreamCompletion(textDiv, () => {
                                     const text = textDiv.innerText;
                                     let target = document.title.replace("ChatGPT - ", "").replace("ChatGPT", "").trim() || "New Chat";
                                     sendWebLog("chatgpt", target, "ChatGPT response: " + text, "ChatGPT");
-                                }, 1500); // delay to let markdown complete streaming
+                                });
                             }
                         }
                     }
@@ -356,10 +412,10 @@ const observer = new MutationObserver((mutations) => {
                 if (host.includes("gemini.google.com")) {
                     const msgContent = node.querySelector('message-content') || (node.tagName === 'MESSAGE-CONTENT' ? node : null);
                     if (msgContent) {
-                        setTimeout(() => {
+                        watchForStreamCompletion(msgContent, () => {
                             const text = msgContent.innerText;
                             sendWebLog("gemini", "Gemini Chat", "Gemini response: " + text, "Gemini");
-                        }, 2000);
+                        });
                     }
                 }
 
@@ -367,11 +423,11 @@ const observer = new MutationObserver((mutations) => {
                 if (host.includes("claude.ai")) {
                     const claudeMsg = node.querySelector('.font-claude-message') || (node.classList.contains('font-claude-message') ? node : null);
                     if (claudeMsg) {
-                        setTimeout(() => {
+                        watchForStreamCompletion(claudeMsg, () => {
                             const text = claudeMsg.innerText;
                             const target = document.title.replace("Claude", "").trim() || "Claude Chat";
                             sendWebLog("claude", target, "Claude response: " + text, "Claude");
-                        }, 2000);
+                        });
                     }
                 }
 
@@ -401,7 +457,7 @@ const observer = new MutationObserver((mutations) => {
         }
     }
 });
-observer.observe(document.body, { childList: true, subtree: true });
+observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-pre-plain-text'] });
 
 // --- GOOGLE MEET CLOSED CAPTIONS PROCESSOR ---
 const activeCaptions = new Map();

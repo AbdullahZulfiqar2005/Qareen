@@ -18,6 +18,8 @@ steps you took.
 | `hyprland_monitor.py`   | Watches Hyprland logs/crash reports and asks the LLM for a diagnosis. |
 | `embedding_script.py`   | One-time offline script that builds the local Arch Wiki FAISS index. |
 | `qareen_embeddings.py`  | Shared client so `chat.py`/`hyprland_monitor.py` reuse the already-running embedding server instead of loading the model again. |
+| `qareen_dotenv.py`      | Shared `.env` loader used by `chat.py`/`hyprland_monitor.py`/the rofi UI. |
+| `rofi_ui/`              | Rofi-based prompt bar for Hyprland - ask your digital twin a question via keybind and get the answer in a styled popup. See `rofi_ui/README.md`. |
 
 ## Setup
 
@@ -28,7 +30,13 @@ source ~/venv/bin/activate
 pip install -r requirements.txt
 
 # 2. Groq API key (required — there is no baked-in default)
+# Either export it in your shell profile:
 export GROQ_API_KEY="your-key-here"   # get one at https://console.groq.com/keys
+# ...or, simpler, drop it in a .env file and it'll be picked up automatically
+# by main.go, chat.py, hyprland_monitor.py, and the rofi UI:
+mkdir -p ~/.config/qareen
+cp .env.example ~/.config/qareen/.env
+$EDITOR ~/.config/qareen/.env   # fill in GROQ_API_KEY=your-key-here
 
 # 3. Build the Go binary
 go build -o qareen .
@@ -49,6 +57,21 @@ qareen query "how did I fix the wifi driver issue last time?"
 qareen list 50
 qareen stop
 ```
+
+## Rofi UI (Hyprland)
+
+A keybind-triggered prompt bar so you don't need a terminal open to ask your
+digital twin something. See `rofi_ui/README.md` for full setup; the short
+version:
+
+```bash
+# requires `qareen start` to already be running, and rofi installed
+bind = SUPER, A, exec, ~/Qareen/rofi_ui/qareen-rofi.sh   # add to hyprland.conf
+```
+
+Press the keybind, type a question, and the answer comes back from the same
+memory-timeline + Groq pipeline `qareen query` uses - so it's logged back
+into your history just the same.
 
 ## Known limitations / ideas for next steps
 
@@ -74,3 +97,20 @@ qareen stop
   participants, not just your own. That's worth being deliberate about —
   some jurisdictions have consent requirements around recording
   conversations, even informally to a personal database.
+- **Site DOM selectors will drift.** ChatGPT/Gemini/Claude/WhatsApp
+  regularly change their markup, and `content.js`'s selectors are matched
+  against a snapshot of each site at one point in time. If message capture
+  silently stops working for one platform, that's the most likely cause —
+  open the target site's devtools console, check for `Qareen Content
+  Script` logs, and update the relevant selector in `content.js`.
+- **Re-signing the Firefox extension.** `content.js` was changed as part of
+  this update (see fix notes below). Firefox extensions must be
+  cryptographically signed by Mozilla to install permanently in release
+  Firefox, and that signature covers the exact file contents — so any edit
+  to `content.js`/`background.js` invalidates your existing signed `.xpi`.
+  After changing the extension, rebuild it (`./package_extension.sh`) and
+  re-upload the new `qareen.xpi` at
+  https://addons.mozilla.org/developers/ for Mozilla to re-sign, then
+  reinstall it. (Firefox Developer Edition with
+  `xpinstall.signatures.required` set to `false` skips this, if you use
+  that build instead.)
