@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -135,7 +136,16 @@ func startDaemon() {
 	if !isPortOpen(ServerPort) {
 		fmt.Println("Launching local embedding & tab server...")
 		pyBin := filepath.Join(os.Getenv("HOME"), "venv/bin/python")
-		pyCmd := exec.Command(pyBin, "embedding_server.py")
+
+		pyScript := "embedding_server.py"
+		if _, err := os.Stat(pyScript); os.IsNotExist(err) {
+			workspaceScript := filepath.Join(os.Getenv("HOME"), "Qareen", "embedding_server.py")
+			if _, err := os.Stat(workspaceScript); err == nil {
+				pyScript = workspaceScript
+			}
+		}
+
+		pyCmd := exec.Command(pyBin, pyScript)
 		pyCmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 		// Redirect output to log file
@@ -186,28 +196,58 @@ func stopDaemon() {
 	_, daemonPidPath, pyPidPath, _ := getPaths()
 
 	stoppedAny := false
+	var daemonPid, pyPid int
 
 	// Kill Go Daemon
 	if isPidRunning(daemonPidPath) {
 		pidData, _ := os.ReadFile(daemonPidPath)
-		pid, _ := strconv.Atoi(string(bytes.TrimSpace(pidData)))
-		fmt.Printf("Stopping Qareen daemon (PID %d)...\n", pid)
-		syscall.Kill(pid, syscall.SIGTERM)
-		os.Remove(daemonPidPath)
+		daemonPid, _ = strconv.Atoi(string(bytes.TrimSpace(pidData)))
+		fmt.Printf("Stopping Qareen daemon (PID %d)...\n", daemonPid)
+		syscall.Kill(daemonPid, syscall.SIGTERM)
 		stoppedAny = true
 	}
 
 	// Kill Python Server
 	if isPidRunning(pyPidPath) {
 		pidData, _ := os.ReadFile(pyPidPath)
-		pid, _ := strconv.Atoi(string(bytes.TrimSpace(pidData)))
-		fmt.Printf("Stopping embedding server (PID %d)...\n", pid)
-		syscall.Kill(pid, syscall.SIGTERM)
-		os.Remove(pyPidPath)
+		pyPid, _ = strconv.Atoi(string(bytes.TrimSpace(pidData)))
+		fmt.Printf("Stopping embedding server (PID %d)...\n", pyPid)
+		syscall.Kill(pyPid, syscall.SIGTERM)
 		stoppedAny = true
 	}
 
 	if stoppedAny {
+		// Wait for processes to actually stop and free resources/ports
+		fmt.Print("Waiting for services to release resources...")
+		for i := 0; i < 30; i++ {
+			daemonRunning := false
+			if daemonPid > 0 {
+				if proc, err := os.FindProcess(daemonPid); err == nil {
+					if err := proc.Signal(syscall.Signal(0)); err == nil {
+						daemonRunning = true
+					}
+				}
+			}
+			pyRunning := false
+			if pyPid > 0 {
+				if proc, err := os.FindProcess(pyPid); err == nil {
+					if err := proc.Signal(syscall.Signal(0)); err == nil {
+						pyRunning = true
+					}
+				}
+			}
+			if !daemonRunning && !pyRunning && !isPortOpen(ServerPort) {
+				break
+			}
+			fmt.Print(".")
+			time.Sleep(200 * time.Millisecond)
+		}
+		fmt.Println()
+
+		// Clean up pid files at the end
+		os.Remove(daemonPidPath)
+		os.Remove(pyPidPath)
+
 		fmt.Printf("%sQareen background services stopped.%s\n", Yellow, Reset)
 	} else {
 		fmt.Println("No active Qareen services found running.")
@@ -284,6 +324,9 @@ func runDaemonLoop() {
 	}
 
 	logInfo("Daemon loop started.")
+
+	// Start native Hyprland keybind tracker
+	go startKeybindTracker(db)
 
 	// Signal handling for graceful shutdown
 	sigs := make(chan os.Signal, 1)
@@ -697,6 +740,22 @@ func queryDaemon(queryText string) {
 	}
 	timeline := timelineBuilder.String()
 
+	// 4. Fetch Arch Wiki Reference Context
+	var wikiDocs []WikiResult
+	wikiResults, err := searchArchWiki(queryText)
+	if err == nil {
+		wikiDocs = wikiResults
+	}
+
+	var wikiBuilder strings.Builder
+	if len(wikiDocs) > 0 {
+		wikiBuilder.WriteString("\n\nRelevant Arch Wiki Documentation (Reference Fallback):\n")
+		for _, doc := range wikiDocs {
+			wikiBuilder.WriteString(fmt.Sprintf("--- Source: %s ---\n%s\n\n", doc.Source, doc.Content))
+		}
+	}
+	wikiContext := wikiBuilder.String()
+
 	fmt.Printf("\n%s%s🕵️‍♂️ Qareen: Scanning your memory timeline...%s\n", Blue, Bold, Reset)
 	fmt.Printf("%s[Timeline Context Retrieved (Top Semantic Matches)]%s\n", Yellow, Reset)
 	fmt.Println(timeline)
@@ -704,7 +763,7 @@ func queryDaemon(queryText string) {
 	fmt.Printf("%s🧠 Generating guidance from your digital twin...%s\n\n", Green, Reset)
 
 	// Stream guidance response from Groq
-	err = queryGroqLLM(queryText, timeline)
+	err = queryGroqLLM(queryText, timeline, wikiContext)
 	if err != nil {
 		fmt.Printf("\n%sError querying LLM: %v%s\n", Red, err, Reset)
 	} else {
@@ -713,14 +772,49 @@ func queryDaemon(queryText string) {
 	}
 }
 
-func queryGroqLLM(query, timeline string) error {
+type WikiResult struct {
+	Content string `json:"content"`
+	Source  string `json:"source"`
+}
+
+func searchArchWiki(query string) ([]WikiResult, error) {
+	payload, err := json.Marshal(map[string]interface{}{
+		"query": query,
+		"k":     3,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := http.Post(ServerURL+"/wiki-search", "application/json", bytes.NewBuffer(payload))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("error status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var res struct {
+		Results []WikiResult `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, err
+	}
+
+	return res.Results, nil
+}
+
+func queryGroqLLM(query, timeline, wikiContext string) error {
 	apiKey := os.Getenv("GROQ_API_KEY")
 	if apiKey == "" {
 		return fmt.Errorf("GROQ_API_KEY environment variable is not set. Export it (e.g. in ~/.zshrc or ~/.bashrc) before running qareen: export GROQ_API_KEY=\"your-key-here\"")
 	}
 
-	systemContent := "You are Qareen, the user's digital twin assistant. Your role is to guide the user on how they previously resolved an issue, based on their logged activities (terminal commands, active window titles, Firefox search/history/tabs, system errors). Analyze the context timeline provided. If they ran specific commands, visited stackoverflow, or fixed config files, summarize the exact steps they took so they can quickly fix it again."
-	userContent := fmt.Sprintf("User Query: %s\n\nRelevant Interaction Context (Timeline):\n%s", query, timeline)
+	systemContent := "You are Qareen, the user's digital twin assistant. Your role is to guide the user on how they previously resolved an issue, based on their logged activities (timeline). If the user's memory timeline does not contain a clear resolution or solution steps to fix the issue, consult the provided Arch Wiki Documentation (Reference Fallback) to formulate and suggest the correct troubleshooting steps."
+	userContent := fmt.Sprintf("User Query: %s\n\nRelevant Interaction Context (Timeline):\n%s%s", query, timeline, wikiContext)
 
 	requestBody, err := json.Marshal(map[string]interface{}{
 		"model": GroqModel,
@@ -989,3 +1083,404 @@ func logError(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	fmt.Fprintf(os.Stderr, "[ERROR] [%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), msg)
 }
+
+// ---------------- HYPRLAND KEYBIND TRACKER ----------------
+
+type HyprBind struct {
+	Locked      bool   `json:"locked"`
+	Mouse       bool   `json:"mouse"`
+	Release     bool   `json:"release"`
+	Repeat      bool   `json:"repeat"`
+	Modmask     int    `json:"modmask"`
+	Key         string `json:"key"`
+	Keycode     int    `json:"keycode"`
+	Dispatcher  string `json:"dispatcher"`
+	Arg         string `json:"arg"`
+}
+
+type inputEvent struct {
+	TimeSec  int64
+	TimeUsec int64
+	Type     uint16
+	Code     uint16
+	Value    int32
+}
+
+var (
+	activeModifiers int
+	cachedBinds     []HyprBind
+	bindsMutex      sync.RWMutex
+)
+
+func startKeybindTracker(db *sql.DB) {
+	logInfo("Initializing Hyprland keybind tracker...")
+	// Fetch keybinds periodically
+	go refreshBindsLoop()
+
+	var activeReaders = make(map[string]bool)
+	var readersMutex sync.Mutex
+	eventChan := make(chan inputEvent, 100)
+
+	for {
+		devices, err := findKeyboardDevices()
+		if err == nil {
+			readersMutex.Lock()
+			for _, devPath := range devices {
+				if !activeReaders[devPath] {
+					activeReaders[devPath] = true
+					go func(path string) {
+						defer func() {
+							readersMutex.Lock()
+							delete(activeReaders, path)
+							readersMutex.Unlock()
+						}()
+						readInputEvents(path, eventChan)
+					}(devPath)
+				}
+			}
+			readersMutex.Unlock()
+		}
+
+		select {
+		case ev := <-eventChan:
+			handleInputEvent(db, ev)
+		case <-time.After(10 * time.Second):
+			// Periodically loop to scan for newly connected keyboards
+		}
+	}
+}
+
+func refreshBindsLoop() {
+	for {
+		refreshBinds()
+		time.Sleep(60 * time.Second)
+	}
+}
+
+func refreshBinds() {
+	cmd := exec.Command("hyprctl", "binds", "-j")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := cmd.Run()
+	if err != nil {
+		logError("Failed to fetch Hyprland binds: %v", err)
+		return
+	}
+
+	var binds []HyprBind
+	if err := json.Unmarshal(out.Bytes(), &binds); err != nil {
+		logError("Failed to parse Hyprland binds JSON: %v", err)
+		return
+	}
+
+	bindsMutex.Lock()
+	cachedBinds = binds
+	bindsMutex.Unlock()
+}
+
+func findKeyboardDevices() ([]string, error) {
+	var kbdDevices []string
+	baseDir := "/dev/input/by-path"
+	files, err := os.ReadDir(baseDir)
+	if err == nil {
+		for _, f := range files {
+			if strings.HasSuffix(f.Name(), "-event-kbd") {
+				kbdDevices = append(kbdDevices, filepath.Join(baseDir, f.Name()))
+			}
+		}
+	}
+	// Fallback to active event files if /dev/input/by-path is not set up
+	if len(kbdDevices) == 0 {
+		files, err := os.ReadDir("/dev/input")
+		if err == nil {
+			for _, f := range files {
+				if strings.HasPrefix(f.Name(), "event") {
+					devPath := filepath.Join("/dev/input", f.Name())
+					kbdDevices = append(kbdDevices, devPath)
+				}
+			}
+		}
+	}
+	return kbdDevices, nil
+}
+
+func readInputEvents(devPath string, eventChan chan inputEvent) {
+	file, err := os.Open(devPath)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	buf := make([]byte, 24)
+	for {
+		n, err := file.Read(buf)
+		if err != nil {
+			return
+		}
+		if n == 24 {
+			var ev inputEvent
+			ev.TimeSec = int64(binary.LittleEndian.Uint64(buf[0:8]))
+			ev.TimeUsec = int64(binary.LittleEndian.Uint64(buf[8:16]))
+			ev.Type = binary.LittleEndian.Uint16(buf[16:18])
+			ev.Code = binary.LittleEndian.Uint16(buf[18:20])
+			ev.Value = int32(binary.LittleEndian.Uint32(buf[20:24]))
+			eventChan <- ev
+		}
+	}
+}
+
+func isModifier(code uint16) bool {
+	switch code {
+	case 42, 54, 29, 97, 56, 100, 125, 126, 58:
+		return true
+	}
+	return false
+}
+
+func getModifierBit(code uint16) int {
+	switch code {
+	case 42, 54: // Shift
+		return 1
+	case 58: // Caps Lock
+		return 2
+	case 29, 97: // Control
+		return 4
+	case 56, 100: // Alt
+		return 8
+	case 125, 126: // Super
+		return 64
+	}
+	return 0
+}
+
+func handleInputEvent(db *sql.DB, ev inputEvent) {
+	if ev.Type == 1 { // EV_KEY
+		if isModifier(ev.Code) {
+			if ev.Code == 58 { // Caps Lock
+				if ev.Value == 1 { // Toggle on press
+					activeModifiers ^= 2
+				}
+			} else {
+				if ev.Value == 1 {
+					activeModifiers |= getModifierBit(ev.Code)
+				} else if ev.Value == 0 {
+					activeModifiers &= ^getModifierBit(ev.Code)
+				}
+			}
+		} else if ev.Value == 1 { // Key press only (no release/repeat)
+			keyName := translateKeycode(ev.Code)
+			if keyName != "" {
+				matchAndLogKeybind(db, activeModifiers, keyName)
+			}
+		}
+	}
+}
+
+func matchAndLogKeybind(db *sql.DB, modmask int, key string) {
+	bindsMutex.RLock()
+	defer bindsMutex.RUnlock()
+
+	for _, bind := range cachedBinds {
+		if bind.Modmask == modmask && strings.ToLower(bind.Key) == key {
+			keybindText := getFriendlyKeybindText(modmask, key)
+			actionText := bind.Dispatcher
+			if bind.Arg != "" {
+				actionText += " " + bind.Arg
+			}
+			logText := fmt.Sprintf("Keybind triggered: %s -> %s", keybindText, actionText)
+
+			logInfo("Keybind Match: %s", logText)
+			logEvent(db, "keybind", "hyprland", logText)
+			break
+		}
+	}
+}
+
+func getFriendlyKeybindText(modmask int, key string) string {
+	var parts []string
+	if (modmask & 64) != 0 {
+		parts = append(parts, "SUPER")
+	}
+	if (modmask & 4) != 0 {
+		parts = append(parts, "CTRL")
+	}
+	if (modmask & 8) != 0 {
+		parts = append(parts, "ALT")
+	}
+	if (modmask & 1) != 0 {
+		parts = append(parts, "SHIFT")
+	}
+	parts = append(parts, strings.ToUpper(key))
+	return strings.Join(parts, " + ")
+}
+
+func sendKeybindNotification(keybind, dispatcher, arg string) {
+	actionText := dispatcher
+	if arg != "" {
+		actionText += " " + arg
+	}
+	// Trigger desktop notification routed to swaync
+	cmd := exec.Command("notify-send", "-a", "Qareen", "-i", "keyboard", keybind, "Action: "+actionText)
+	cmd.Run()
+}
+
+func translateKeycode(code uint16) string {
+	switch code {
+	case 1:
+		return "escape"
+	case 2:
+		return "1"
+	case 3:
+		return "2"
+	case 4:
+		return "3"
+	case 5:
+		return "4"
+	case 6:
+		return "5"
+	case 7:
+		return "6"
+	case 8:
+		return "7"
+	case 9:
+		return "8"
+	case 10:
+		return "9"
+	case 11:
+		return "0"
+	case 12:
+		return "minus"
+	case 13:
+		return "equal"
+	case 14:
+		return "backspace"
+	case 15:
+		return "tab"
+	case 16:
+		return "q"
+	case 17:
+		return "w"
+	case 18:
+		return "e"
+	case 19:
+		return "r"
+	case 20:
+		return "t"
+	case 21:
+		return "y"
+	case 22:
+		return "u"
+	case 23:
+		return "i"
+	case 24:
+		return "o"
+	case 25:
+		return "p"
+	case 26:
+		return "bracketleft"
+	case 27:
+		return "bracketright"
+	case 28:
+		return "enter"
+	case 30:
+		return "a"
+	case 31:
+		return "s"
+	case 32:
+		return "d"
+	case 33:
+		return "f"
+	case 34:
+		return "g"
+	case 35:
+		return "h"
+	case 36:
+		return "j"
+	case 37:
+		return "k"
+	case 38:
+		return "l"
+	case 39:
+		return "semicolon"
+	case 40:
+		return "apostrophe"
+	case 41:
+		return "grave"
+	case 43:
+		return "backslash"
+	case 44:
+		return "z"
+	case 45:
+		return "x"
+	case 46:
+		return "c"
+	case 47:
+		return "v"
+	case 48:
+		return "b"
+	case 49:
+		return "n"
+	case 50:
+		return "m"
+	case 51:
+		return "comma"
+	case 52:
+		return "period"
+	case 53:
+		return "slash"
+	case 57:
+		return "space"
+	case 59:
+		return "f1"
+	case 60:
+		return "f2"
+	case 61:
+		return "f3"
+	case 62:
+		return "f4"
+	case 63:
+		return "f5"
+	case 64:
+		return "f6"
+	case 65:
+		return "f7"
+	case 66:
+		return "f8"
+	case 67:
+		return "f9"
+	case 68:
+		return "f10"
+	case 87:
+		return "f11"
+	case 88:
+		return "f12"
+	case 103:
+		return "up"
+	case 105:
+		return "left"
+	case 106:
+		return "right"
+	case 108:
+		return "down"
+	case 113:
+		return "xf86audiosplay"
+	case 114:
+		return "xf86audiolowervolume"
+	case 115:
+		return "xf86audioraisevolume"
+	case 163:
+		return "xf86audionext"
+	case 164:
+		return "xf86audioplay"
+	case 165:
+		return "xf86audioprev"
+	case 166:
+		return "xf86audiostop"
+	case 224:
+		return "xf86monbrightnessdown"
+	case 225:
+		return "xf86monbrightnessup"
+	}
+	return ""
+}
+

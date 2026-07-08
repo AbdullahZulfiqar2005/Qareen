@@ -20,5 +20,18 @@
   ],
   "background": {
     "scripts": ["background.js"]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "qareen-companion@abdullah.org",
+      "data_collection_permissions": {
+        "required": [
+          "browsingActivity",
+          "personalCommunications"
+        ]
+      }
+    }
   }
 }
+
+

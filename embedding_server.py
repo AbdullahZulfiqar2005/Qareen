@@ -8,6 +8,7 @@ import sqlite3
 import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
 
 # GROQ_API_KEY is only needed by chat.py / hyprland_monitor.py / main.go, not
 # by this server (it never calls Groq itself). We intentionally do NOT set a
@@ -38,6 +39,18 @@ _db_conn.execute("""CREATE TABLE IF NOT EXISTS events (
     embedding BLOB
 )""")
 _db_conn.commit()
+
+# Load local Arch Wiki FAISS index (resolve absolute path relative to the script location)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+WIKI_INDEX_PATH = os.path.join(SCRIPT_DIR, "arch_wiki_index")
+_wiki_store = None
+if os.path.exists(WIKI_INDEX_PATH):
+    print("Loading local Arch Wiki FAISS index...")
+    try:
+        _wiki_store = FAISS.load_local(WIKI_INDEX_PATH, model, allow_dangerous_deserialization=True)
+        print("Arch Wiki FAISS index loaded successfully.")
+    except Exception as e:
+        print(f"Warning: Failed to load Arch Wiki FAISS index: {str(e)}")
 
 
 def pack_embedding(embedding):
@@ -96,6 +109,35 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({'embeddings': embeddings}).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(f"Error: {str(e)}".encode('utf-8'))
+                
+        elif self.path == '/wiki-search':
+            try:
+                content_length = int(self.headers['Content-Length'])
+                post_data = self.rfile.read(content_length)
+                data = json.loads(post_data.decode('utf-8'))
+                
+                query = data.get('query', '')
+                k = data.get('k', 3)
+                
+                results = []
+                if _wiki_store and query:
+                    docs = _wiki_store.similarity_search(query, k=k)
+                    for doc in docs:
+                        results.append({
+                            'content': doc.page_content,
+                            'source': doc.metadata.get('source', 'Unknown')
+                        })
+                
+                self.send_response(200)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'results': results}).encode('utf-8'))
             except Exception as e:
                 self.send_response(500)
                 self.send_header('Access-Control-Allow-Origin', '*')

@@ -21,60 +21,12 @@ function isDuplicate(text) {
     return false;
 }
 
-// Log page browsing visit on load (excluding the specialized high-traffic domains)
-const initialHost = window.location.hostname;
-if (initialHost && 
-    !initialHost.includes("chatgpt.com") && 
-    !initialHost.includes("web.whatsapp.com") && 
-    !initialHost.includes("meet.google.com")) {
-    const title = document.title || initialHost;
-    const url = window.location.href;
-    sendWebLog("browse", initialHost, `Visited webpage: ${title} (URL: ${url})`, "You");
-}
-
-function getWhatsAppContact() {
-    let name = "Unknown";
-    const mainHeader = document.querySelector('#main header');
-    if (mainHeader) {
-        // Query elements with [title] and filter out utility titles
-        const titleEls = mainHeader.querySelectorAll('[title]');
-        for (const el of titleEls) {
-            const titleVal = el.getAttribute('title');
-            if (titleVal && titleVal.trim()) {
-                const lower = titleVal.trim().toLowerCase();
-                if (lower !== "profile details" && 
-                    lower !== "search…" && 
-                    lower !== "click here for contact info" && 
-                    lower !== "menu") {
-                    name = titleVal.trim();
-                    break;
-                }
-            }
-        }
-        
-        // Fallback: scan spans in main header for text content
-        if (name === "Unknown") {
-            const spans = mainHeader.querySelectorAll('span');
-            for (const span of spans) {
-                const text = span.innerText.trim();
-                if (text && text.length > 0 && 
-                    !/^(online|typing\.\.\.|click here for contact info|profile details|$)/i.test(text) && 
-                    text.length < 50) {
-                    name = text;
-                    break;
-                }
-            }
-        }
-    }
-    return name;
-}
-
 function sendWebLog(site, target, content, sender = "You") {
     content = content.trim();
     if (!content) return;
     if (isDuplicate(content)) return;
     
-    console.log(`Qareen Content Script sending message: [${site}] -> ${content.substring(0, 30)}...`);
+    console.log(`Qareen Content Script sending message: [${site}] -> ${content.substring(0, 50)}...`);
     try {
         chrome.runtime.sendMessage({
             action: "logWeb",
@@ -88,78 +40,126 @@ function sendWebLog(site, target, content, sender = "You") {
     }
 }
 
-// --- METHOD 1: KEYDOWN & CLICK LISTENERS (CAPTURE PHASE) ---
+// Check for input sensitivity
+function isSensitiveInput(targetEl) {
+    if (!targetEl) return false;
+    const type = (targetEl.getAttribute('type') || '').toLowerCase();
+    const id = (targetEl.id || '').toLowerCase();
+    const name = (targetEl.name || '').toLowerCase();
+    const className = (targetEl.className || '').toLowerCase();
 
-// Capture phase keydown listener
+    return type === 'password' || 
+           id.includes('pass') || name.includes('pass') || className.includes('pass') ||
+           id.includes('card') || name.includes('card') || className.includes('card') ||
+           id.includes('cvv') || name.includes('cvv') || className.includes('cvv') ||
+           id.includes('ssn') || name.includes('ssn') || className.includes('ssn') ||
+           id.includes('token') || name.includes('token') || className.includes('token') ||
+           id.includes('key') || name.includes('key') || className.includes('key') ||
+           id.includes('secret') || name.includes('secret') || className.includes('secret');
+}
+
+// Listen to generic keydowns & clicks for chat inputs
 document.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
+        const host = window.location.hostname;
+        const targetEl = e.target;
+        if (!targetEl || isSensitiveInput(targetEl)) return;
+
         let text = "";
         let site = "";
         let target = "";
-        const host = window.location.hostname;
 
-        // Specialized checkers
         if (host.includes("chatgpt.com")) {
             const textarea = document.getElementById("prompt-textarea");
-            if (textarea && e.target === textarea) {
+            if (textarea && targetEl === textarea) {
                 text = textarea.value;
                 site = "chatgpt";
-                target = document.title.replace("ChatGPT - ", "").replace("ChatGPT", "").trim();
-                if (!target) target = "New Chat";
+                target = document.title.replace("ChatGPT - ", "").replace("ChatGPT", "").trim() || "New Chat";
                 if (text) setTimeout(() => sendWebLog(site, target, text, "You"), 100);
             }
         } else if (host.includes("web.whatsapp.com")) {
             const input = document.querySelector('div[contenteditable="true"]');
-            if (input && input.contains(e.target)) {
+            if (input && input.contains(targetEl)) {
                 text = input.innerText;
                 site = "whatsapp";
                 target = getWhatsAppContact();
                 if (text) setTimeout(() => sendWebLog(site, target, text, "You"), 200);
             }
-        } else if (!host.includes("meet.google.com")) {
-            // General websites text logger
-            const targetEl = e.target;
-            if (!targetEl) return;
-
-            const isInput = targetEl.tagName === 'INPUT' || targetEl.tagName === 'TEXTAREA';
-            const isContentEditable = targetEl.getAttribute('contenteditable') === 'true' || targetEl.isContentEditable;
-
-            if (isInput || isContentEditable) {
-                // SENSITIVITY PRIVACY CHECK: Do not capture passwords or sensitive keys
-                const type = (targetEl.getAttribute('type') || '').toLowerCase();
-                const id = (targetEl.id || '').toLowerCase();
-                const name = (targetEl.name || '').toLowerCase();
-                const className = (targetEl.className || '').toLowerCase();
-
-                const isSensitive = type === 'password' || 
-                                    id.includes('pass') || name.includes('pass') || className.includes('pass') ||
-                                    id.includes('card') || name.includes('card') || className.includes('card') ||
-                                    id.includes('cvv') || name.includes('cvv') || className.includes('cvv') ||
-                                    id.includes('ssn') || name.includes('ssn') || className.includes('ssn') ||
-                                    id.includes('token') || name.includes('token') || className.includes('token') ||
-                                    id.includes('key') || name.includes('key') || className.includes('key') ||
-                                    id.includes('secret') || name.includes('secret') || className.includes('secret');
-
-                if (isSensitive) return;
-
-                text = isInput ? targetEl.value : targetEl.innerText;
-                if (text && text.trim().length > 3) {
-                    const pageTitle = document.title || host;
-                    const fieldName = name || id || targetEl.tagName.toLowerCase();
-                    const logText = `Submitted text in field '${fieldName}' on page '${pageTitle}': ${text.trim()}`;
-                    setTimeout(() => sendWebLog("input", host, logText, "You"), 150);
+        } else if (host.includes("gemini.google.com")) {
+            const editor = document.querySelector('div[contenteditable="true"]') || document.querySelector('.input-area textarea');
+            if (editor && (targetEl === editor || editor.contains(targetEl))) {
+                text = editor.innerText || editor.value;
+                site = "gemini";
+                target = "Gemini Chat";
+                if (text) setTimeout(() => sendWebLog(site, target, text, "You"), 150);
+            }
+        } else if (host.includes("claude.ai")) {
+            const editor = document.querySelector('div[contenteditable="true"]') || document.querySelector('[role="textbox"]');
+            if (editor && (targetEl === editor || editor.contains(targetEl))) {
+                text = editor.innerText;
+                site = "claude";
+                target = document.title.replace("Claude", "").trim() || "Claude Chat";
+                if (text) setTimeout(() => sendWebLog(site, target, text, "You"), 150);
+            }
+        } else if (host.includes("x.com") || host.includes("grok.com")) {
+            if (window.location.pathname.includes("/grok") || host.includes("grok.com")) {
+                const editor = document.querySelector('div[contenteditable="true"]') || document.querySelector('textarea');
+                if (editor && (targetEl === editor || editor.contains(targetEl))) {
+                    text = editor.innerText || editor.value;
+                    site = "grok";
+                    target = "Grok Chat";
+                    if (text) setTimeout(() => sendWebLog(site, target, text, "You"), 150);
                 }
+            }
+        } else if (host.includes("linkedin.com")) {
+            const editor = document.querySelector('.msg-form__contenteditable') || document.querySelector('div[role="textbox"]');
+            if (editor && (targetEl === editor || editor.contains(targetEl))) {
+                text = editor.innerText;
+                site = "linkedin";
+                target = getLinkedInContact();
+                if (text) setTimeout(() => sendWebLog(site, target, text, "You"), 200);
+            }
+        } else if (host.includes("instagram.com")) {
+            const editor = document.querySelector('div[role="textbox"]') || document.querySelector('textarea');
+            if (editor && (targetEl === editor || editor.contains(targetEl))) {
+                text = editor.innerText || editor.value;
+                site = "instagram";
+                target = getInstagramContact();
+                if (text) setTimeout(() => sendWebLog(site, target, text, "You"), 200);
+            }
+        } else if (host.includes("chess.com")) {
+            const chatInput = document.querySelector('.chat-input-input') || document.querySelector('input[placeholder*="chat" Tint]');
+            if (chatInput && targetEl === chatInput) {
+                text = chatInput.value;
+                site = "chess";
+                target = "Game Chat";
+                if (text) setTimeout(() => sendWebLog(site, target, text, "You"), 100);
+            }
+        } else if (host.includes("reddit.com")) {
+            const commentBox = document.querySelector('shreddit-composer textarea') || document.querySelector('textarea[placeholder*="comment"]');
+            if (commentBox && targetEl === commentBox) {
+                text = commentBox.value;
+                site = "reddit";
+                target = "Reddit Comment";
+                if (text) setTimeout(() => sendWebLog(site, target, "Posted comment: " + text, "You"), 200);
+            }
+        } else if (host.includes("github.com")) {
+            const commentBox = document.getElementById("new_comment_field") || document.querySelector('.comment-form-textarea');
+            if (commentBox && targetEl === commentBox) {
+                text = commentBox.value;
+                site = "github";
+                target = "GitHub Comment";
+                if (text) setTimeout(() => sendWebLog(site, target, "Posted comment on GitHub: " + text, "You"), 200);
             }
         }
     }
-}, true); // Capture phase is key!
+}, true);
 
-// Capture phase click listener
 document.addEventListener('click', (e) => {
+    const host = window.location.hostname;
     let text = "";
     let site = "";
     let target = "";
-    const host = window.location.hostname;
 
     if (host.includes("chatgpt.com")) {
         const sendBtn = document.querySelector('[data-testid="send-button"]') || e.target.closest('[data-testid="send-button"]');
@@ -168,8 +168,7 @@ document.addEventListener('click', (e) => {
             if (textarea) {
                 text = textarea.value;
                 site = "chatgpt";
-                target = document.title.replace("ChatGPT - ", "").replace("ChatGPT", "").trim();
-                if (!target) target = "New Chat";
+                target = document.title.replace("ChatGPT - ", "").replace("ChatGPT", "").trim() || "New Chat";
             }
         }
     } else if (host.includes("web.whatsapp.com")) {
@@ -182,26 +181,129 @@ document.addEventListener('click', (e) => {
                 target = getWhatsAppContact();
             }
         }
+    } else if (host.includes("gemini.google.com")) {
+        const sendBtn = document.querySelector('button.send-button') || document.querySelector('button[aria-label*="Send"]');
+        if (sendBtn && sendBtn.contains(e.target)) {
+            const editor = document.querySelector('div[contenteditable="true"]') || document.querySelector('.input-area textarea');
+            if (editor) {
+                text = editor.innerText || editor.value;
+                site = "gemini";
+                target = "Gemini Chat";
+            }
+        }
+    } else if (host.includes("claude.ai")) {
+        const sendBtn = document.querySelector('button[aria-label*="Send Message"]') || document.querySelector('button[data-testid="send-button"]');
+        if (sendBtn && sendBtn.contains(e.target)) {
+            const editor = document.querySelector('div[contenteditable="true"]') || document.querySelector('[role="textbox"]');
+            if (editor) {
+                text = editor.innerText;
+                site = "claude";
+                target = document.title.replace("Claude", "").trim() || "Claude Chat";
+            }
+        }
+    } else if (host.includes("x.com") || host.includes("grok.com")) {
+        if (window.location.pathname.includes("/grok") || host.includes("grok.com")) {
+            const sendBtn = document.querySelector('div[data-testid="grok-send"]') || document.querySelector('button[aria-label*="Send"]');
+            if (sendBtn && sendBtn.contains(e.target)) {
+                const editor = document.querySelector('div[contenteditable="true"]') || document.querySelector('textarea');
+                if (editor) {
+                    text = editor.innerText || editor.value;
+                    site = "grok";
+                    target = "Grok Chat";
+                }
+            }
+        }
+    } else if (host.includes("mail.google.com")) {
+        // Intercept Sent Emails in Gmail
+        const sendBtn = e.target.closest('div[role="button"][data-tooltip*="Send"]') || 
+                          e.target.closest('div.T-I.aoO') || 
+                          e.target.closest('.T-I-atl');
+        if (sendBtn) {
+            const composeBox = sendBtn.closest('div.M9') || sendBtn.closest('div[role="dialog"]');
+            if (composeBox) {
+                const toInput = composeBox.querySelector('.vN span[email]') || composeBox.querySelector('input[name="to"]');
+                const toVal = toInput ? (toInput.getAttribute('email') || toInput.innerText || toInput.value) : "Unknown Recipient";
+                const subjectInput = composeBox.querySelector('input[name="subjectbox"]');
+                const subjectVal = subjectInput ? subjectInput.value : "No Subject";
+                const bodyInput = composeBox.querySelector('div[role="textbox"]');
+                const bodyVal = bodyInput ? bodyInput.innerText : "";
+                
+                if (bodyVal) {
+                    sendWebLog("gmail", toVal, `Sent Email (Subject: ${subjectVal}): ${bodyVal}`, "You");
+                }
+            }
+        }
+    } else if (host.includes("linkedin.com")) {
+        const sendBtn = e.target.closest('.msg-form__send-button') || e.target.closest('button[type="submit"]');
+        if (sendBtn) {
+            const editor = document.querySelector('.msg-form__contenteditable') || document.querySelector('div[role="textbox"]');
+            if (editor) {
+                text = editor.innerText;
+                site = "linkedin";
+                target = getLinkedInContact();
+            }
+        }
+    } else if (host.includes("instagram.com")) {
+        const sendBtn = e.target.closest('button[type="button"]') || e.target.closest('div[role="button"]');
+        // Simple logic: if it's in the DM context and sendBtn looks like a text trigger button
+        if (sendBtn && window.location.pathname.includes("/direct/")) {
+            const editor = document.querySelector('div[role="textbox"]') || document.querySelector('textarea');
+            if (editor) {
+                // Wait briefly for text to send, or capture
+                text = editor.innerText || editor.value;
+                site = "instagram";
+                target = getInstagramContact();
+            }
+        }
     }
 
     if (text && site) {
         sendWebLog(site, target, text, "You");
     }
-}, true); // Capture phase is key!
+}, true);
 
-// --- METHOD 2: DOM MUTATION OBSERVER (FALLBACK & AUTOMATIC SCREEN LOGGER) ---
+// Utility functions to resolve names
+function getWhatsAppContact() {
+    let name = "Unknown";
+    const mainHeader = document.querySelector('#main header');
+    if (mainHeader) {
+        const titleEls = mainHeader.querySelectorAll('[title]');
+        for (const el of titleEls) {
+            const titleVal = el.getAttribute('title');
+            if (titleVal && titleVal.trim()) {
+                const lower = titleVal.trim().toLowerCase();
+                if (lower !== "profile details" && lower !== "search…" && lower !== "click here for contact info" && lower !== "menu") {
+                    name = titleVal.trim();
+                    break;
+                }
+            }
+        }
+    }
+    return name;
+}
 
+function getLinkedInContact() {
+    const chatHeader = document.querySelector('.msg-entity-lockup__title') || document.querySelector('.msg-thread__link');
+    if (chatHeader) {
+        return chatHeader.innerText.trim();
+    }
+    return "LinkedIn Contact";
+}
+
+function getInstagramContact() {
+    const chatHeader = document.querySelector('span[x-class*="username"]') || document.querySelector('div[role="presentation"] h1') || document.querySelector('span.x1lliihq');
+    if (chatHeader) {
+        return chatHeader.innerText.trim();
+    }
+    return "Instagram User";
+}
+
+// MutationObserver for incoming responses & page logs
 const observer = new MutationObserver((mutations) => {
     const host = window.location.hostname;
     
-    // 1. Check Google Meet captions
     if (host.includes("meet.google.com")) {
         processMeetCaptions();
-        return;
-    }
-
-    // 2. Only scan chat logs on chatgpt and whatsapp to prevent CPU lag on generic websites
-    if (!host.includes("chatgpt.com") && !host.includes("web.whatsapp.com")) {
         return;
     }
 
@@ -210,7 +312,7 @@ const observer = new MutationObserver((mutations) => {
             for (const node of mutation.addedNodes) {
                 if (node.nodeType !== Node.ELEMENT_NODE) continue;
                 
-                // WhatsApp check
+                // WhatsApp Messages
                 if (host.includes("web.whatsapp.com")) {
                     const msgDiv = node.classList.contains('copyable-text') ? node : node.querySelector('.copyable-text');
                     if (msgDiv && msgDiv.hasAttribute('data-pre-plain-text')) {
@@ -218,78 +320,92 @@ const observer = new MutationObserver((mutations) => {
                         const match = meta.match(/\]\s*(.*?):\s*$/);
                         if (match) {
                             let sender = match[1].trim();
-                            
-                            // Check if this is an outgoing message (sent by you)
-                            const lowerSender = sender.toLowerCase();
-                            const isOutgoing = msgDiv.closest('.message-out') !== null ||
-                                               lowerSender === "you" ||
-                                               lowerSender.includes("abdullah") ||
-                                               lowerSender.includes("zulfiqar");
-                            if (isOutgoing) {
-                                sender = "You";
-                            }
+                            const isOutgoing = msgDiv.closest('.message-out') !== null || sender.toLowerCase() === "you";
+                            if (isOutgoing) sender = "You";
                             
                             const textSpan = msgDiv.querySelector('span.selectable-text.copyable-text');
                             if (textSpan) {
                                 const text = textSpan.innerText;
                                 const chatName = getWhatsAppContact();
                                 sendWebLog("whatsapp", chatName, text, sender);
-                                continue;
                             }
-                        }
-                    }
-                    
-                    // Fallback to class checks
-                    const msgOut = node.classList.contains('message-out') ? node : node.querySelector('.message-out');
-                    if (msgOut && !msgOut.querySelector('.copyable-text')) {
-                        const textSpan = msgOut.querySelector('span.selectable-text.copyable-text');
-                        if (textSpan) {
-                            const text = textSpan.innerText;
-                            const chatName = getWhatsAppContact();
-                            sendWebLog("whatsapp", chatName, text, "You");
-                        }
-                    }
-                    const msgIn = node.classList.contains('message-in') ? node : node.querySelector('.message-in');
-                    if (msgIn && !msgIn.querySelector('.copyable-text')) {
-                        const textSpan = msgIn.querySelector('span.selectable-text.copyable-text');
-                        if (textSpan) {
-                            const text = textSpan.innerText;
-                            const chatName = getWhatsAppContact();
-                            sendWebLog("whatsapp", chatName, text, chatName);
                         }
                     }
                 }
                 
-                // ChatGPT check: user turn
+                // ChatGPT Responses
                 if (host.includes("chatgpt.com")) {
                     const turn = node.querySelector('[data-testid^="conversation-turn-"]') || 
                                  (node.getAttribute && node.getAttribute('data-testid') && node.getAttribute('data-testid').startsWith('conversation-turn-') ? node : null);
                     if (turn) {
-                        const isUser = turn.querySelector('[data-message-author-role="user"]');
-                        if (isUser) {
-                            const textDiv = turn.querySelector('.whitespace-pre-wrap');
+                        const isAssistant = turn.querySelector('[data-message-author-role="assistant"]');
+                        if (isAssistant) {
+                            const textDiv = turn.querySelector('.markdown');
                             if (textDiv) {
-                                const text = textDiv.innerText;
-                                let target = document.title.replace("ChatGPT - ", "").replace("ChatGPT", "").trim();
-                                if (!target) target = "New Chat";
-                                sendWebLog("chatgpt", target, text, "You");
+                                setTimeout(() => {
+                                    const text = textDiv.innerText;
+                                    let target = document.title.replace("ChatGPT - ", "").replace("ChatGPT", "").trim() || "New Chat";
+                                    sendWebLog("chatgpt", target, "ChatGPT response: " + text, "ChatGPT");
+                                }, 1500); // delay to let markdown complete streaming
                             }
                         }
+                    }
+                }
+
+                // Gemini Responses
+                if (host.includes("gemini.google.com")) {
+                    const msgContent = node.querySelector('message-content') || (node.tagName === 'MESSAGE-CONTENT' ? node : null);
+                    if (msgContent) {
+                        setTimeout(() => {
+                            const text = msgContent.innerText;
+                            sendWebLog("gemini", "Gemini Chat", "Gemini response: " + text, "Gemini");
+                        }, 2000);
+                    }
+                }
+
+                // Claude Responses
+                if (host.includes("claude.ai")) {
+                    const claudeMsg = node.querySelector('.font-claude-message') || (node.classList.contains('font-claude-message') ? node : null);
+                    if (claudeMsg) {
+                        setTimeout(() => {
+                            const text = claudeMsg.innerText;
+                            const target = document.title.replace("Claude", "").trim() || "Claude Chat";
+                            sendWebLog("claude", target, "Claude response: " + text, "Claude");
+                        }, 2000);
+                    }
+                }
+
+                // LinkedIn Feed Posts Scraper
+                if (host.includes("linkedin.com")) {
+                    const post = node.querySelector('.feed-shared-update-v2') || (node.classList.contains('feed-shared-update-v2') ? node : null);
+                    if (post) {
+                        const actor = post.querySelector('.update-components-actor__title');
+                        const body = post.querySelector('.update-components-text');
+                        if (actor && body) {
+                            const actorName = actor.innerText.trim();
+                            const postText = body.innerText.trim();
+                            sendWebLog("linkedin", "LinkedIn Feed", `Viewed LinkedIn post by ${actorName}: ${postText}`, actorName);
+                        }
+                    }
+                }
+
+                // Chess.com Match tracker (move list updates)
+                if (host.includes("chess.com")) {
+                    const moveItem = node.querySelector('.move-list-item') || (node.classList.contains('move-list-item') ? node : null);
+                    if (moveItem) {
+                        const moves = moveItem.innerText.replace(/\n/g, " ").trim();
+                        sendWebLog("chess", "Chess.com Game", "Match moves logged: " + moves, "System");
                     }
                 }
             }
         }
     }
 });
-
-// Start observer
 observer.observe(document.body, { childList: true, subtree: true });
 
 // --- GOOGLE MEET CLOSED CAPTIONS PROCESSOR ---
-
 const activeCaptions = new Map();
 let captionIdCounter = 0;
-
 function processMeetCaptions() {
     const container = document.querySelector('div[jsname="x37oKu"]') || 
                       document.querySelector('[aria-label="Captions"]') ||
@@ -313,22 +429,15 @@ function processMeetCaptions() {
         
         const state = activeCaptions.get(block.dataset.qareenId);
         
-        // Resolve speaker name
         let speaker = "Speaker";
-        const nameEl = block.querySelector('.zs7s8d') || 
-                       block.querySelector('.jmjoTe') || 
-                       block.firstElementChild;
+        const nameEl = block.querySelector('.zs7s8d') || block.querySelector('.jmjoTe') || block.firstElementChild;
         if (nameEl && nameEl.innerText.trim()) {
             speaker = nameEl.innerText.trim();
         }
         state.speaker = speaker;
         
-        // Resolve spoken text
         let speechText = "";
-        const textEl = block.querySelector('.iTTPOb') || 
-                       block.querySelector('.jTuls') || 
-                       block.querySelector('span') || 
-                       block.lastElementChild;
+        const textEl = block.querySelector('.iTTPOb') || block.querySelector('.jTuls') || block.querySelector('span') || block.lastElementChild;
         if (textEl) {
             speechText = textEl.innerText.trim();
         }
@@ -345,7 +454,6 @@ function processMeetCaptions() {
         }
     }
     
-    // Cleanup old captions and dump remaining unlogged text
     for (const key of activeCaptions.keys()) {
         let found = false;
         for (const block of currentActiveElements) {
@@ -364,3 +472,97 @@ function processMeetCaptions() {
         }
     }
 }
+
+// --- SPA URL HISTORY CHANGE LISTENER ---
+let lastUrl = window.location.href;
+function handleUrlChange() {
+    const url = window.location.href;
+    const host = window.location.hostname;
+    const path = window.location.pathname;
+
+    console.log(`Qareen URL change detected: ${url}`);
+
+    // Initial page load triggers for read-only platforms
+    if (host.includes("mail.google.com")) {
+        // Gmail email viewer logger
+        // Wait for thread to load
+        setTimeout(() => {
+            const subjectEl = document.querySelector('h2.hP');
+            const senderEl = document.querySelector('.gD');
+            const bodyEl = document.querySelector('.a3s.aiL') || document.querySelector('div[role="main"]');
+            if (subjectEl && bodyEl) {
+                const subject = subjectEl.innerText.trim();
+                const sender = senderEl ? (senderEl.getAttribute('email') || senderEl.innerText) : "Unknown Sender";
+                const bodySnippet = bodyEl.innerText.substring(0, 500).trim();
+                sendWebLog("gmail", sender, `Read Email (Subject: ${subject}): ${bodySnippet}`, sender);
+            }
+        }, 2000);
+    } else if (host.includes("reddit.com")) {
+        // Reddit post reader
+        if (path.includes("/comments/")) {
+            setTimeout(() => {
+                const sub = path.split('/r/')[1]?.split('/')[0] || "Reddit";
+                const titleEl = document.querySelector('shreddit-title') || document.querySelector('h1');
+                const title = titleEl ? (titleEl.getAttribute('title') || titleEl.innerText) : "Reddit Post";
+                const bodyEl = document.querySelector('div[data-click-id="text_body"]') || document.querySelector('.text-neutral-content');
+                const body = bodyEl ? bodyEl.innerText.substring(0, 800) : "";
+                sendWebLog("reddit", `r/${sub}`, `Read Reddit Post "${title}": ${body}`, "Reddit");
+            }, 2000);
+        }
+    } else if (host.includes("github.com")) {
+        // GitHub repo / file views
+        const segments = path.split('/').filter(Boolean);
+        if (segments.length >= 2) {
+            const owner = segments[0];
+            const repo = segments[1];
+            const type = segments[2] || "root";
+            
+            if (type === "blob") {
+                const filename = segments.slice(4).join('/');
+                sendWebLog("github", `${owner}/${repo}`, `Viewed file: ${filename} in GitHub repository ${owner}/${repo}`, "You");
+            } else if (type === "pull" || type === "issues") {
+                setTimeout(() => {
+                    const titleEl = document.querySelector('.gh-header-title');
+                    const title = titleEl ? titleEl.innerText.trim() : "Issue/PR";
+                    sendWebLog("github", `${owner}/${repo}`, `Viewed ${type === "pull" ? "Pull Request" : "Issue"} #${segments[3]}: ${title}`, "GitHub");
+                }, 2000);
+            } else if (segments.length === 2) {
+                sendWebLog("github", `${owner}/${repo}`, `Visited GitHub repository: ${owner}/${repo}`, "You");
+            }
+        }
+    } else if (host.includes("instagram.com")) {
+        // Instagram post / reel views
+        if (path.startsWith("/p/") || path.startsWith("/reel/")) {
+            setTimeout(() => {
+                const authorEl = document.querySelector('a.x1i10hfl[role="link"]');
+                const author = authorEl ? authorEl.innerText.trim() : "Instagram Account";
+                const descEl = document.querySelector('._ap3a') || document.querySelector('h1');
+                const desc = descEl ? descEl.innerText.substring(0, 500) : "";
+                sendWebLog("instagram", author, `Viewed Instagram post/reel: ${desc}`, author);
+            }, 2500);
+        }
+    } else if (host.includes("chess.com")) {
+        if (path.includes("/game/") || path.includes("/play/")) {
+            setTimeout(() => {
+                const opponentEl = document.querySelector('.player-avatar') || document.querySelector('.player-username-link');
+                const oppName = opponentEl ? opponentEl.innerText.trim() : "Opponent";
+                sendWebLog("chess", "Chess.com Game", `Started / resumed chess match against ${oppName}`, "System");
+            }, 3000);
+        }
+    } else if (!host.includes("chatgpt.com") && !host.includes("web.whatsapp.com") && !host.includes("meet.google.com")) {
+        // Log basic page view on load/change
+        const title = document.title || host;
+        sendWebLog("browse", host, `Visited webpage: ${title} (URL: ${url})`, "You");
+    }
+}
+
+// Poller for URL changes in SPA
+setInterval(() => {
+    if (window.location.href !== lastUrl) {
+        lastUrl = window.location.href;
+        handleUrlChange();
+    }
+}, 1000);
+
+// Run initial logic
+setTimeout(handleUrlChange, 1000);

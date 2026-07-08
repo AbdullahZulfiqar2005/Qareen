@@ -24,3 +24,7 @@ venv/
 *.test
 *.out
 
+# Firefox Extension Package
+qareen.xpi
+
+
