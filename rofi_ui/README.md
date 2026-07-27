@@ -1,3 +1,7 @@
+---
+mainfont: "Open Sans"
+---
+
 # Qareen Rofi UI
 
 A keybind-triggered prompt bar for Hyprland: type a question, get an answer

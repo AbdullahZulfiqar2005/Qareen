@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Qareen Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Qareen</h1>
+    <nav>
+      <button class="tab-btn active" data-tab="timeline">Timeline</button>
+      <button class="tab-btn" data-tab="search">Search</button>
+      <button class="tab-btn" data-tab="analytics">Analytics</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- Timeline -->
+    <section id="tab-timeline" class="tab-content active">
+      <div class="filters">
+        <select id="filter-type"><option value="">All types</option></select>
+        <select id="filter-app"><option value="">All apps</option></select>
+        <button id="filter-apply">Filter</button>
+      </div>
+      <div id="timeline-list"></div>
+      <div class="pagination">
+        <button id="prev-page" disabled>← Prev</button>
+        <span id="page-info"></span>
+        <button id="next-page">Next →</button>
+      </div>
+    </section>
+
+    <!-- Search -->
+    <section id="tab-search" class="tab-content">
+      <div class="search-bar">
+        <input id="search-input" type="text" placeholder="Search your memory…" autocomplete="off">
+        <button id="search-btn">Search</button>
+      </div>
+      <div id="search-results"></div>
+    </section>
+
+    <!-- Analytics -->
+    <section id="tab-analytics" class="tab-content">
+      <div id="stat-cards" class="stat-cards"></div>
+      <div class="charts-grid">
+        <div class="chart-box">
+          <h3>Activity by Hour</h3>
+          <div id="chart-hour" class="bar-chart"></div>
+        </div>
+        <div class="chart-box">
+          <h3>Events by Type</h3>
+          <div id="chart-type" class="bar-chart"></div>
+        </div>
+        <div class="chart-box">
+          <h3>Top Apps</h3>
+          <div id="chart-app" class="bar-chart"></div>
+        </div>
+        <div class="chart-box wide">
+          <h3>Daily Activity (Last 30 Days)</h3>
+          <div id="chart-daily" class="bar-chart horizontal"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

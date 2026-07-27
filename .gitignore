@@ -27,4 +27,8 @@ venv/
 # Firefox Extension Package
 qareen.xpi
 
+# PDFs
+*.pdf
+
+
 

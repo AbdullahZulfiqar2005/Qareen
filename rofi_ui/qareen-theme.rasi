@@ -1,34 +1,50 @@
 /**
  * Qareen rofi theme.
  *
- * Dark, glassy, curved-corner look. Pair with the Hyprland windowrules in
- * hyprland-snippet.conf for a fade + scale-in "pop" animation and background
- * blur, since rofi itself doesn't animate its own window.
+ * Dark, glassy, neon-accented look with layered depth and typographic
+ * hierarchy. Pair with the Hyprland windowrules in hyprland-snippet.conf
+ * for a fade + scale-in "pop" animation and background blur, since rofi
+ * itself doesn't animate its own window.
  */
 
 * {
     font:   "JetBrainsMono Nerd Font 12";
 
-    bg0:    #1a1b26e6; /* base background, ~90% opacity for the blur to show through */
-    bg1:    #24283bcc;
-    bg2:    #2f334d;
-    fg0:    #c0caf5;
-    fg1:    #a9b1d6;
-    accent: #7aa2f7;
-    accent2:#bb9af7;
-    urgent: #f7768e;
+    /* ── Base palette ─────────────────────────────────────────────── */
+    bg-deep:  #13141fda;         /* outermost shell — darkest, 85% opacity */
+    bg0:      #1a1b26d9;         /* window body, slightly translucent      */
+    bg1:      #24283bcc;         /* inner containers (inputbar, message)   */
+    bg2:      #2f334daa;         /* raised surfaces, selected elements     */
+    bg-hover: #363b5480;         /* subtle hover highlight                 */
+
+    /* ── Foreground ───────────────────────────────────────────────── */
+    fg0:      #c0caf5;           /* primary text                           */
+    fg1:      #a9b1d6;           /* secondary text                         */
+    fg-dim:   #565f89;           /* placeholder / muted text               */
+
+    /* ── Accents ──────────────────────────────────────────────────── */
+    accent:      #7aa2f7;        /* primary accent — neon blue              */
+    accent-glow: #7aa2f766;      /* soft blue glow (40% opacity)            */
+    accent2:     #bb9af7;        /* secondary accent — purple               */
+    accent2-glow:#bb9af74d;      /* soft purple glow (30% opacity)          */
+    teal:        #73daca;        /* tertiary accent for variety             */
+    urgent:      #f7768e;        /* errors / warnings                       */
+    urgent-glow: #f7768e4d;      /* soft red glow                           */
 
     background-color: transparent;
     text-color:       @fg0;
 }
 
+/* ════════════════════════════════════════════════════════════════════
+ *  WINDOW — Neon glow border with layered glass
+ * ════════════════════════════════════════════════════════════════════ */
 window {
-    transparency: "real";
-    background-color: @bg0;
-    border:           2px;
+    transparency:     "real";
+    background-color: @bg-deep;
+    border:           3px;
     border-color:     @accent;
-    border-radius:    18px;
-    padding:          18px;
+    border-radius:    20px;
+    padding:          0;
     width:            720px;
     location:         center;
     anchor:           center;
@@ -36,50 +52,68 @@ window {
     y-offset:         -40px;
 }
 
+/* ── Mainbox — inner glass layer for depth ─────────────────────── */
 mainbox {
-    background-color: transparent;
-    spacing: 12px;
-    children: [ inputbar, message, listview ];
+    background-color: @bg0;
+    border-radius:    17px;
+    padding:          20px;
+    spacing:          14px;
+    children:         [ inputbar, message, listview ];
 }
 
+/* ════════════════════════════════════════════════════════════════════
+ *  INPUT BAR — Neon-framed prompt
+ * ════════════════════════════════════════════════════════════════════ */
 inputbar {
     background-color: @bg1;
+    border:           1px;
+    border-color:     @accent-glow;
     border-radius:    14px;
-    padding:          12px 16px;
-    spacing:          8px;
-    children: [ prompt, entry ];
+    padding:          14px 18px;
+    spacing:          10px;
+    children:         [ prompt, entry ];
 }
 
 prompt {
     background-color: transparent;
-    text-color:        @accent2;
-    font:              "JetBrainsMono Nerd Font Bold 12";
+    text-color:       @accent2;
+    font:             "JetBrainsMono Nerd Font Bold 13";
 }
 
 entry {
-    background-color: transparent;
+    background-color:  transparent;
     text-color:        @fg0;
-    placeholder:        "Ask your digital twin anything...";
-    placeholder-color:  @fg1;
-    cursor:             text;
+    font:              "JetBrainsMono Nerd Font 12";
+    placeholder:       "Ask your digital twin anything...";
+    placeholder-color: @fg-dim;
+    cursor:            text;
 }
 
+/* ════════════════════════════════════════════════════════════════════
+ *  MESSAGE — Answer / info display area
+ * ════════════════════════════════════════════════════════════════════ */
 message {
     background-color: @bg1;
+    border:           1px;
+    border-color:     @bg2;
     border-radius:    14px;
-    padding:          14px 16px;
-    text-color:        @fg0;
+    padding:          16px 20px;
+    text-color:       @fg0;
 }
 
 textbox {
     background-color: transparent;
-    text-color:        @fg0;
-    markup:            false;
+    text-color:       @fg0;
+    font:             "JetBrainsMono Nerd Font 11";
+    markup:           false;
 }
 
+/* ════════════════════════════════════════════════════════════════════
+ *  LISTVIEW & ELEMENTS
+ * ════════════════════════════════════════════════════════════════════ */
 listview {
     background-color: transparent;
-    spacing:          6px;
+    spacing:          4px;
     lines:            6;
     scrollbar:        false;
     fixed-height:     false;
@@ -88,26 +122,45 @@ listview {
 element {
     background-color: transparent;
     border-radius:    10px;
-    padding:          8px 12px;
+    padding:          10px 14px;
 }
 
-element selected {
+element normal.normal {
+    background-color: transparent;
+}
+
+element alternate.normal {
+    background-color: transparent;
+}
+
+element selected.normal {
     background-color: @bg2;
-    text-color:        @accent;
+    text-color:       @accent;
+    border:           0 0 0 3px;
+    border-color:     @accent;
 }
 
 element-text {
     background-color: transparent;
-    text-color:        inherit;
-    vertical-align:    0.5;
+    text-color:       inherit;
+    vertical-align:   0.5;
+    highlight:        bold underline;
 }
 
+element-icon {
+    background-color: transparent;
+    size:             1.2em;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ *  ERROR MESSAGE — Urgent-toned variant
+ * ════════════════════════════════════════════════════════════════════ */
 error-message {
-    background-color: @bg0;
-    border:           2px;
+    background-color: @bg-deep;
+    border:           3px;
     border-color:     @urgent;
-    border-radius:    18px;
-    padding:          20px;
-    text-color:        @fg0;
+    border-radius:    20px;
+    padding:          0;
+    text-color:       @fg0;
     width:            720px;
 }

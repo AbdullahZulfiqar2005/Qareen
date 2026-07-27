@@ -1,8 +1,8 @@
 import os
-import sys
 import json
 import struct
 import threading
+import time
 import lz4.block
 import sqlite3
 import datetime
@@ -52,12 +52,242 @@ if os.path.exists(WIKI_INDEX_PATH):
     except Exception as e:
         print(f"Warning: Failed to load Arch Wiki FAISS index: {str(e)}")
 
+# --- Event FAISS Index ---
+EVENT_INDEX_PATH = os.path.expanduser("~/.qareen_event_index")
+_event_index_lock = threading.Lock()
+_event_store = None
+_last_indexed_id = 0
+_event_index_dirty = False
+_event_insert_count = 0
+
+
+def _unpack_blob(blob):
+    """Unpack a binary embedding BLOB into a list of floats."""
+    if not blob or len(blob) % 4 != 0:
+        return None
+    return list(struct.unpack(f"<{len(blob) // 4}f", blob))
+
+
+def _load_or_build_event_index():
+    """Load existing event FAISS index from disk, or build from SQLite."""
+    global _event_store, _last_indexed_id
+
+    index_file = os.path.join(EVENT_INDEX_PATH, "index.faiss")
+    meta_file = os.path.join(EVENT_INDEX_PATH, "meta.json")
+
+    if os.path.exists(index_file):
+        print("Loading event FAISS index from disk...")
+        try:
+            _event_store = FAISS.load_local(
+                EVENT_INDEX_PATH, model, allow_dangerous_deserialization=True
+            )
+            if os.path.exists(meta_file):
+                with open(meta_file) as f:
+                    meta = json.load(f)
+                    _last_indexed_id = meta.get("last_indexed_id", 0)
+            print(f"Event index loaded (last_indexed_id={_last_indexed_id}).")
+            return
+        except Exception as e:
+            print(f"Warning: Failed to load event index, rebuilding: {e}")
+
+    print("Building event FAISS index from database...")
+    with _db_lock:
+        cursor = _db_conn.execute(
+            "SELECT id, timestamp, event_type, app, content, embedding "
+            "FROM events WHERE embedding IS NOT NULL ORDER BY id"
+        )
+        rows = cursor.fetchall()
+
+    if not rows:
+        print("No events with embeddings found. Index will be created on first insert.")
+        return
+
+    texts = []
+    embeddings = []
+    metadatas = []
+    max_id = 0
+
+    for row_id, ts, etype, app, content, blob in rows:
+        vec = _unpack_blob(blob)
+        if vec is None or len(vec) != 384:
+            continue
+        texts.append(content)
+        embeddings.append(vec)
+        metadatas.append({
+            "event_id": row_id,
+            "timestamp": ts,
+            "event_type": etype,
+            "app": app,
+        })
+        max_id = row_id
+
+    if texts:
+        _event_store = FAISS.from_embeddings(
+            list(zip(texts, embeddings)),
+            model,
+            metadatas=metadatas,
+        )
+        _last_indexed_id = max_id
+        _save_event_index()
+        print(f"Event index built with {len(texts)} events (last_id={max_id}).")
+    else:
+        print("No valid embeddings found. Index will be created on first insert.")
+
+
+def _save_event_index():
+    """Persist the event FAISS index and metadata to disk."""
+    global _event_index_dirty
+    if _event_store is None:
+        return
+    os.makedirs(EVENT_INDEX_PATH, exist_ok=True)
+    _event_store.save_local(EVENT_INDEX_PATH)
+    with open(os.path.join(EVENT_INDEX_PATH, "meta.json"), "w") as f:
+        json.dump({"last_indexed_id": _last_indexed_id}, f)
+    _event_index_dirty = False
+
+
+def _sync_new_events():
+    """Index any events inserted by the Go daemon since last sync."""
+    global _event_store, _last_indexed_id, _event_index_dirty
+
+    with _db_lock:
+        cursor = _db_conn.execute(
+            "SELECT id, timestamp, event_type, app, content, embedding "
+            "FROM events WHERE id > ? AND embedding IS NOT NULL ORDER BY id",
+            (_last_indexed_id,),
+        )
+        rows = cursor.fetchall()
+
+    if not rows:
+        return
+
+    texts = []
+    embeddings = []
+    metadatas = []
+    max_id = _last_indexed_id
+
+    for row_id, ts, etype, app, content, blob in rows:
+        vec = _unpack_blob(blob)
+        if vec is None or len(vec) != 384:
+            continue
+        texts.append(content)
+        embeddings.append(vec)
+        metadatas.append({
+            "event_id": row_id,
+            "timestamp": ts,
+            "event_type": etype,
+            "app": app,
+        })
+        max_id = row_id
+
+    if not texts:
+        return
+
+    if _event_store is None:
+        _event_store = FAISS.from_embeddings(
+            list(zip(texts, embeddings)),
+            model,
+            metadatas=metadatas,
+        )
+    else:
+        _event_store.add_embeddings(
+            list(zip(texts, embeddings)),
+            metadatas=metadatas,
+        )
+
+    _last_indexed_id = max_id
+    _event_index_dirty = True
+
+
+def _add_event_to_index(event_id, timestamp, event_type, app, content, embedding_vec):
+    """Add a single newly inserted event to the in-memory FAISS index."""
+    global _event_store, _last_indexed_id, _event_index_dirty, _event_insert_count
+
+    meta = {
+        "event_id": event_id,
+        "timestamp": timestamp,
+        "event_type": event_type,
+        "app": app,
+    }
+
+    if _event_store is None:
+        _event_store = FAISS.from_embeddings(
+            [(content, embedding_vec)],
+            model,
+            metadatas=[meta],
+        )
+    else:
+        _event_store.add_embeddings(
+            [(content, embedding_vec)],
+            metadatas=[meta],
+        )
+
+    _last_indexed_id = max(_last_indexed_id, event_id)
+    _event_index_dirty = True
+    _event_insert_count += 1
+
+    if _event_insert_count % 50 == 0:
+        with _event_index_lock:
+            _save_event_index()
+
+
+def _background_index_saver():
+    """Periodically save the event index to disk if dirty."""
+    while True:
+        time.sleep(60)
+        with _event_index_lock:
+            if _event_index_dirty:
+                try:
+                    _save_event_index()
+                except Exception as e:
+                    print(f"Warning: Failed to save event index: {e}")
+
+
+_load_or_build_event_index()
+_saver_thread = threading.Thread(target=_background_index_saver, daemon=True)
+_saver_thread.start()
+
 
 def pack_embedding(embedding):
     """Pack a list of floats into a little-endian float32 blob - the same
     compact binary format main.go writes/reads, instead of a JSON array of
     float64 text (~5x smaller on disk, no JSON parsing needed to read back)."""
     return struct.pack(f"<{len(embedding)}f", *embedding)
+
+
+def format_web_event(site, target, content, sender):
+    """Format a browser extension event into a human-readable string for storage."""
+    ai_site_names = {"chatgpt": "ChatGPT", "claude": "Claude", "gemini": "Gemini", "grok": "Grok"}
+    if site in ai_site_names:
+        pretty = ai_site_names[site]
+        response_prefix = f"{pretty} response: "
+        if content.startswith(response_prefix):
+            reply_text = content[len(response_prefix):]
+            return f"{pretty} replied in conversation '{target}': {reply_text}"
+        else:
+            return f"Prompted {pretty} in conversation '{target}': {content}"
+    elif site == "whatsapp":
+        if not sender or sender == "You":
+            return f"Sent WhatsApp message to {target}: {content}"
+        else:
+            if sender == target:
+                return f"Received WhatsApp message from {target}: {content}"
+            else:
+                return f"Received WhatsApp message from {sender} in group '{target}': {content}"
+    elif site == "google-meet":
+        return f"Google Meet meeting transcript: {sender} said: {content}"
+    elif site == "linkedin":
+        return f"Sent LinkedIn message to {target}: {content}"
+    elif site == "instagram":
+        return f"Sent Instagram DM to {target}: {content}"
+    elif site == "reddit":
+        return content
+    elif site == "github":
+        return content
+    elif site == "gmail":
+        return content
+    else:
+        return f"Web event on {site}: {content}"
 
 
 def find_firefox_profile():
@@ -144,6 +374,51 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(f"Error: {str(e)}".encode('utf-8'))
                 
+        elif self.path == '/search':
+            try:
+                content_length = int(self.headers['Content-Length'])
+                post_data = self.rfile.read(content_length)
+                data = json.loads(post_data.decode('utf-8'))
+
+                query = data.get('query', '')
+                k = data.get('k', 12)
+
+                if not query:
+                    self.send_response(400)
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(b"Error: 'query' cannot be empty.")
+                    return
+
+                with _event_index_lock:
+                    _sync_new_events()
+
+                results = []
+                if _event_store is not None:
+                    with _event_index_lock:
+                        docs_and_scores = _event_store.similarity_search_with_score(query, k=k)
+                    for doc, score in docs_and_scores:
+                        similarity = 1.0 - float(score)
+                        results.append({
+                            'event_id': doc.metadata.get('event_id', 0),
+                            'timestamp': doc.metadata.get('timestamp', ''),
+                            'event_type': doc.metadata.get('event_type', ''),
+                            'app': doc.metadata.get('app', ''),
+                            'content': doc.page_content,
+                            'score': similarity,
+                        })
+
+                self.send_response(200)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'results': results}).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(f"Error: {str(e)}".encode('utf-8'))
+
         elif self.path == '/log-web':
             try:
                 content_length = int(self.headers['Content-Length'])
@@ -163,21 +438,7 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                     return
                 
                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                db_content = ""
-                if site == "chatgpt":
-                    db_content = f"Prompted ChatGPT in conversation '{target}': {content}"
-                elif site == "whatsapp":
-                    if not sender or sender == "You":
-                        db_content = f"Sent WhatsApp message to {target}: {content}"
-                    else:
-                        if sender == target:
-                            db_content = f"Received WhatsApp message from {target}: {content}"
-                        else:
-                            db_content = f"Received WhatsApp message from {sender} in group '{target}': {content}"
-                elif site == "google-meet":
-                    db_content = f"Google Meet meeting transcript: {sender} said: {content}"
-                else:
-                    db_content = f"Web event on {site}: {content}"
+                db_content = format_web_event(site, target, content, sender)
                 
                 # Generate embedding based on the descriptive event
                 formatted_text = f"[{timestamp}] [{site.upper()}] [{target}] {db_content}"
@@ -189,11 +450,17 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                 # browser activity) guarded by a lock since it's shared across
                 # ThreadingHTTPServer's worker threads.
                 with _db_lock:
-                    _db_conn.execute(
+                    cursor = _db_conn.execute(
                         "INSERT INTO events (timestamp, event_type, app, content, embedding) VALUES (?, ?, ?, ?, ?)",
                         (timestamp, site, target, db_content, embedding_blob),
                     )
+                    new_id = cursor.lastrowid
                     _db_conn.commit()
+
+                with _event_index_lock:
+                    _add_event_to_index(
+                        new_id, timestamp, site, target, db_content, embedding
+                    )
                 
                 print(f"[Web Log] Successfully saved {site} event: {content[:50]}...")
                 

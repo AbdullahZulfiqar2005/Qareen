@@ -28,6 +28,34 @@ if ! command -v rofi >/dev/null 2>&1; then
     exit 1
 fi
 
+# ── Per-phase theme overrides ───────────────────────────────────────
+# Each rofi invocation gets a distinct visual identity via -theme-str
+# without needing separate .rasi files.
+
+# Thinking phase: purple accent border + purple message text (signals "processing")
+THINK_STYLE='
+window { border-color: #bb9af7; width: 600px; }
+mainbox { padding: 16px; }
+message { border-color: #bb9af74d; }
+textbox { text-color: #bb9af7; font: "JetBrainsMono Nerd Font Bold 12"; }
+'
+
+# Answer phase: wider window with more breathing room for reading
+ANSWER_STYLE='
+window { width: 800px; }
+mainbox { padding: 24px; spacing: 16px; }
+message { padding: 20px 24px; }
+textbox { font: "JetBrainsMono Nerd Font 11"; }
+'
+
+# Error phase: urgent red border + red message text
+ERROR_STYLE='
+window { border-color: #f7768e; width: 720px; }
+mainbox { padding: 20px; }
+message { border-color: #f7768e4d; }
+textbox { text-color: #f7768e; }
+'
+
 # 1. Grab the prompt. No stdin entries are piped in on purpose - this is a
 #    free-text prompt, not a picker, so rofi should always accept whatever
 #    was typed rather than requiring it to match a list item.
@@ -40,7 +68,8 @@ if [ -z "${prompt// }" ]; then
 fi
 
 # 2. Show a "thinking" indicator while the query runs in the background.
-rofi -theme "$THEME" -e "🧠 Qareen is thinking..." &
+rofi -theme "$THEME" -theme-str "$THINK_STYLE" \
+    -e "  Querying your memory timeline..." &
 THINK_PID=$!
 
 # 3. Run the actual query (embedding similarity + Arch Wiki fallback + Groq),
@@ -55,10 +84,11 @@ kill "$THINK_PID" 2>/dev/null || true
 wait "$THINK_PID" 2>/dev/null || true
 
 if [ $status -ne 0 ]; then
-    rofi -theme "$THEME" -e "⚠ $answer"
+    rofi -theme "$THEME" -theme-str "$ERROR_STYLE" \
+        -e "  $answer"
     exit 0
 fi
 
 # 5. Show the final answer. rofi -e wraps long text and closes on
 #    click/Escape/Enter.
-rofi -theme "$THEME" -e "$answer"
+rofi -theme "$THEME" -theme-str "$ANSWER_STYLE" -e "$answer"

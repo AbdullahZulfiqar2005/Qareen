@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"database/sql"
+	"embed"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"net"
 	"net/http"
@@ -15,23 +17,31 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 
 	_ "github.com/glebarez/go-sqlite"
 )
 
 // Global Configuration
 const (
-	ServerPort = "2846"
-	ServerURL  = "http://127.0.0.1:" + ServerPort
-	GroqModel  = "llama-3.3-70b-versatile"
-	EmbedDim   = 384 // output dimension of the all-MiniLM-L6-v2 sentence embedding model
+	ServerPort     = "2846"
+	ServerURL      = "http://127.0.0.1:" + ServerPort
+	DashboardPort  = "2847"
+	GroqModel      = "llama-3.3-70b-versatile"
+	EmbedDim       = 384 // output dimension of the all-MiniLM-L6-v2 sentence embedding model
 )
+
+//go:embed dashboard/*
+var dashboardFS embed.FS
 
 // ANSI Colors
 const (
@@ -147,6 +157,8 @@ func main() {
 		listEvents(limit)
 	case "clear":
 		clearEvents()
+	case "dashboard":
+		serveDashboard()
 	default:
 		printUsage()
 	}
@@ -161,6 +173,7 @@ func printUsage() {
 	fmt.Println("  qareen query <issue>  Search history and get AI-guided instructions on past fixes")
 	fmt.Println("  qareen list [limit]   List the most recently logged events")
 	fmt.Println("  qareen clear          Delete all logged events from the database")
+	fmt.Println("  qareen dashboard      Open the web dashboard at http://localhost:2847")
 }
 
 // ---------------- DAEMON MANAGEMENT ----------------
@@ -185,8 +198,19 @@ func startDaemon() {
 
 	fmt.Println("Starting Qareen system tracking service...")
 
-	// 1. Start Python embedding server if port is not active
-	if !isPortOpen(ServerPort) {
+	// 1. Start Python embedding server if port is not active.
+	//
+	// IMPORTANT: a failure here must NOT stop step 2 below. Previously this
+	// function returned early on any embedding-server failure (missing venv,
+	// python crash, etc.), which silently prevented ALL perception - shell
+	// commands, active window, browser tabs, system logs, everything - from
+	// being tracked, not just AI-query/embedding support. logEvent() already
+	// degrades gracefully (saves events with a NULL embedding) when the
+	// embedding server is unreachable, so the tracking daemon should always
+	// start; we just warn clearly that embeddings/qareen query won't work
+	// until the embedding server issue is fixed.
+	embeddingServerOK := isPortOpen(ServerPort)
+	if !embeddingServerOK {
 		fmt.Println("Launching local embedding & tab server...")
 		pyBin := filepath.Join(os.Getenv("HOME"), "venv/bin/python")
 
@@ -210,23 +234,28 @@ func startDaemon() {
 
 		err = pyCmd.Start()
 		if err != nil {
-			fmt.Printf("Error starting python embedding server: %v\n", err)
-			return
-		}
+			fmt.Printf("%sWarning: failed to start python embedding server: %v%s\n", Yellow, err, Reset)
+			fmt.Println("Tracking will continue, but embeddings, 'qareen query', and browser-extension logging will not work until this is fixed.")
+			fmt.Printf("Check that %s exists (see README setup step 1), or that %s is available on PATH.\n", pyBin, pyScript)
+		} else {
+			// Write Python PID
+			os.WriteFile(pyPidPath, []byte(strconv.Itoa(pyCmd.Process.Pid)), 0644)
 
-		// Write Python PID
-		os.WriteFile(pyPidPath, []byte(strconv.Itoa(pyCmd.Process.Pid)), 0644)
-
-		// Wait for port to open (up to 10 seconds)
-		for i := 0; i < 20; i++ {
-			if isPortOpen(ServerPort) {
-				break
+			// Wait for port to open (up to 10 seconds)
+			for i := 0; i < 20; i++ {
+				if isPortOpen(ServerPort) {
+					embeddingServerOK = true
+					break
+				}
+				time.Sleep(500 * time.Millisecond)
 			}
-			time.Sleep(500 * time.Millisecond)
+			if !embeddingServerOK {
+				fmt.Printf("%sWarning: embedding server did not come up within 10s. Tracking will continue without it.%s\n", Yellow, Reset)
+			}
 		}
 	}
 
-	// 2. Start Go Daemon process
+	// 2. Start Go Daemon process (always - independent of step 1's outcome)
 	cmd := exec.Command(os.Args[0], "run-daemon")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -381,6 +410,12 @@ func runDaemonLoop() {
 	// Start native Hyprland keybind tracker
 	go startKeybindTracker(db)
 
+	// Start desktop notification watcher (dunst/mako/swaync/etc via DBus)
+	go startNotificationWatcher(db)
+
+	// Start file creation/deletion watcher (Downloads/Documents/Desktop)
+	go startFileWatcher(db)
+
 	// Signal handling for graceful shutdown
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
@@ -462,6 +497,30 @@ func runDaemonLoop() {
 								logContent = "Prompted/Viewed ChatGPT: " + parts[1]
 							} else {
 								logContent = "Opened ChatGPT"
+							}
+						} else if strings.Contains(t, "Claude") {
+							appType = "claude"
+							if strings.Contains(t, " - ") {
+								parts := strings.SplitN(t, " - ", 2)
+								logContent = "Prompted/Viewed Claude: " + parts[1]
+							} else {
+								logContent = "Opened Claude"
+							}
+						} else if strings.Contains(t, "Gemini") {
+							appType = "gemini"
+							if strings.Contains(t, " - ") {
+								parts := strings.SplitN(t, " - ", 2)
+								logContent = "Prompted/Viewed Gemini: " + parts[1]
+							} else {
+								logContent = "Opened Gemini"
+							}
+						} else if strings.Contains(t, "Grok") {
+							appType = "grok"
+							if strings.Contains(t, " - ") {
+								parts := strings.SplitN(t, " - ", 2)
+								logContent = "Prompted/Viewed Grok: " + parts[1]
+							} else {
+								logContent = "Opened Grok"
 							}
 						} else if strings.Contains(t, "Google Search") {
 							appType = "google"
@@ -717,14 +776,7 @@ func decodeEmbedding(raw []byte) ([]float64, bool) {
 func queryDaemon(queryText string) {
 	dbPath, _, _, _ := getPaths()
 
-	// 1. Fetch embedding of query
-	qEmbed, err := getEmbedding(queryText)
-	if err != nil {
-		fmt.Printf("%sError: Failed to embed query using local server (%v). Make sure service is running.%s\n", Red, err, Reset)
-		return
-	}
-
-	// 2. Open DB
+	// Open DB (needed for logging the query as an event at the end)
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		fmt.Printf("Error opening SQLite: %v\n", err)
@@ -732,35 +784,50 @@ func queryDaemon(queryText string) {
 	}
 	defer db.Close()
 
-	// 3. Scan database and calculate similarity
-	rows, err := db.Query("SELECT id, timestamp, event_type, app, content, embedding FROM events")
+	// Semantic search via FAISS index on the embedding server
+	searchPayload, _ := json.Marshal(map[string]interface{}{
+		"query": queryText,
+		"k":     12,
+	})
+	searchResp, err := http.Post(ServerURL+"/search", "application/json", bytes.NewBuffer(searchPayload))
 	if err != nil {
-		fmt.Printf("Error querying events: %v\n", err)
+		fmt.Printf("Error calling search endpoint: %v\n", err)
 		return
 	}
-	defer rows.Close()
+	defer searchResp.Body.Close()
+	searchBody, err := io.ReadAll(searchResp.Body)
+	if err != nil {
+		fmt.Printf("Error reading search response: %v\n", err)
+		return
+	}
+
+	var searchResult struct {
+		Results []struct {
+			EventID   int     `json:"event_id"`
+			Timestamp string  `json:"timestamp"`
+			EventType string  `json:"event_type"`
+			App       string  `json:"app"`
+			Content   string  `json:"content"`
+			Score     float64 `json:"score"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(searchBody, &searchResult); err != nil {
+		fmt.Printf("Error parsing search response: %v\n", err)
+		return
+	}
 
 	var matches []SimilarityMatch
-	for rows.Next() {
-		var id int
-		var timestamp, eventType, app, content string
-		var embedRaw []byte
-		if err := rows.Scan(&id, &timestamp, &eventType, &app, &content, &embedRaw); err == nil {
-			embedding, ok := decodeEmbedding(embedRaw)
-			if ok && len(embedding) == EmbedDim {
-				score := cosineSimilarity(qEmbed, embedding)
-				matches = append(matches, SimilarityMatch{
-					Event: Event{
-						ID:        id,
-						Timestamp: timestamp,
-						Type:      eventType,
-						App:       app,
-						Content:   content,
-					},
-					Score: score,
-				})
-			}
-		}
+	for _, r := range searchResult.Results {
+		matches = append(matches, SimilarityMatch{
+			Event: Event{
+				ID:        r.EventID,
+				Timestamp: r.Timestamp,
+				Type:      r.EventType,
+				App:       r.App,
+				Content:   r.Content,
+			},
+			Score: r.Score,
+		})
 	}
 
 	if len(matches) == 0 {
@@ -1140,15 +1207,15 @@ func logError(format string, args ...interface{}) {
 // ---------------- HYPRLAND KEYBIND TRACKER ----------------
 
 type HyprBind struct {
-	Locked      bool   `json:"locked"`
-	Mouse       bool   `json:"mouse"`
-	Release     bool   `json:"release"`
-	Repeat      bool   `json:"repeat"`
-	Modmask     int    `json:"modmask"`
-	Key         string `json:"key"`
-	Keycode     int    `json:"keycode"`
-	Dispatcher  string `json:"dispatcher"`
-	Arg         string `json:"arg"`
+	Locked     bool   `json:"locked"`
+	Mouse      bool   `json:"mouse"`
+	Release    bool   `json:"release"`
+	Repeat     bool   `json:"repeat"`
+	Modmask    int    `json:"modmask"`
+	Key        string `json:"key"`
+	Keycode    int    `json:"keycode"`
+	Dispatcher string `json:"dispatcher"`
+	Arg        string `json:"arg"`
 }
 
 type inputEvent struct {
@@ -1164,6 +1231,229 @@ var (
 	cachedBinds     []HyprBind
 	bindsMutex      sync.RWMutex
 )
+
+// startNotificationWatcher perceives desktop notifications (dunst, mako,
+// swaync, or any other DBus-compliant notification daemon) by eavesdropping
+// on calls to org.freedesktop.Notifications.Notify on the session bus via
+// `dbus-monitor`. This is the same mechanism dedicated notification-log
+// tools use, and it requires no new library dependency - just the `dbus`
+// package that's already present on virtually every Linux desktop.
+//
+// If dbus-monitor isn't installed or the session bus can't be reached (e.g.
+// running headless, or eavesdrop is blocked by bus policy), this logs a
+// clear warning once and returns without affecting any other tracker.
+func startNotificationWatcher(db *sql.DB) {
+	logInfo("Initializing desktop notification watcher (dbus-monitor)...")
+
+	if _, err := exec.LookPath("dbus-monitor"); err != nil {
+		logError("dbus-monitor not found on PATH; desktop notifications will not be tracked. Install the 'dbus' package to enable this.")
+		return
+	}
+
+	for {
+		if err := runNotificationMonitor(db); err != nil {
+			logError("Notification watcher error (will retry in 10s): %v", err)
+		}
+		time.Sleep(10 * time.Second)
+	}
+}
+
+// runNotificationMonitor runs a single dbus-monitor session and parses its
+// output until the process exits or errors, at which point the caller
+// retries. Returning (rather than looping forever inside) lets
+// startNotificationWatcher log+backoff consistently on repeated failures.
+func runNotificationMonitor(db *sql.DB) error {
+	cmd := exec.Command("dbus-monitor", "--session",
+		"interface='org.freedesktop.Notifications',member='Notify',eavesdrop=true")
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to attach to dbus-monitor stdout: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start dbus-monitor: %w", err)
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	// dbus-monitor prints each Notify() call as a "method call" header line
+	// followed by its arguments, one per line, each indented by exactly 3
+	// spaces for top-level args (nested array/dict contents are indented
+	// further and are intentionally ignored here). The Notify() signature is
+	// (app_name, replaces_id, app_icon, summary, body, actions, hints,
+	// expire_timeout) - so top-level arg #1 is app_name, #4 is summary, #5 is
+	// body.
+	stringArgRe := regexp.MustCompile(`^string "(.*)"$`)
+	inCall := false
+	argIdx := 0
+	var appName, summary, body string
+
+	flush := func() {
+		if appName != "" || summary != "" || body != "" {
+			content := fmt.Sprintf("Notification from %s: %s - %s", appName, summary, body)
+			logEvent(db, "notification", appName, content)
+		}
+		appName, summary, body = "", "", ""
+		argIdx = 0
+		inCall = false
+	}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+
+		if strings.HasPrefix(trimmed, "method call") {
+			if inCall {
+				flush() // a new call started before we saw a blank separator - flush the previous one
+			}
+			if strings.Contains(line, "member=Notify") {
+				inCall = true
+				argIdx = 0
+			}
+			continue
+		}
+		if !inCall {
+			continue
+		}
+
+		leading := len(line) - len(strings.TrimLeft(line, " "))
+		if leading == 0 {
+			// A non-indented line with no "method call" prefix marks the end
+			// of this entry's arguments (e.g. "signal time=..." for an
+			// unrelated event interleaved on the bus).
+			flush()
+			continue
+		}
+		if leading == 3 {
+			argIdx++
+			if m := stringArgRe.FindStringSubmatch(trimmed); m != nil {
+				switch argIdx {
+				case 1:
+					appName = m[1]
+				case 4:
+					summary = m[1]
+				case 5:
+					body = m[1]
+				}
+			}
+		}
+		// Deeper indentation = nested array/dict contents (actions, hints) -
+		// intentionally skipped.
+	}
+	flush()
+
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("dbus-monitor exited: %w", err)
+	}
+	return scanner.Err()
+}
+
+// startFileWatcher perceives file creation/deletion (including moves, which
+// show up as CREATE-at-destination / DELETE-at-source) in the user's common
+// working directories via inotify. Uses golang.org/x/sys/unix directly
+// (already an indirect dependency via github.com/glebarez/go-sqlite) rather
+// than pulling in a new third-party fsnotify-style library.
+//
+// Directories that don't exist on this system (e.g. no ~/Desktop) are
+// skipped silently; if none of the configured directories exist, or inotify
+// itself is unavailable, this logs a warning once and returns without
+// affecting any other tracker.
+func startFileWatcher(db *sql.DB) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		logError("Could not determine home directory; file tracking disabled: %v", err)
+		return
+	}
+
+	watchDirs := []string{
+		filepath.Join(home, "Downloads"),
+		filepath.Join(home, "Documents"),
+		filepath.Join(home, "Desktop"),
+	}
+
+	fd, err := unix.InotifyInit1(unix.IN_NONBLOCK)
+	if err != nil {
+		logError("Failed to initialize inotify; file tracking disabled: %v", err)
+		return
+	}
+	defer unix.Close(fd)
+
+	watchToDir := make(map[int32]string)
+	const flags = unix.IN_CREATE | unix.IN_MOVED_TO | unix.IN_DELETE | unix.IN_MOVED_FROM
+
+	for _, dir := range watchDirs {
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			continue
+		}
+		wd, err := unix.InotifyAddWatch(fd, dir, flags)
+		if err != nil {
+			logError("Failed to watch directory %s: %v", dir, err)
+			continue
+		}
+		watchToDir[int32(wd)] = dir
+		logInfo("Watching directory for file changes: %s", dir)
+	}
+
+	if len(watchToDir) == 0 {
+		logInfo("No watchable directories found (checked Downloads/Documents/Desktop); file tracking disabled.")
+		return
+	}
+
+	// Debounce: editors/downloaders often fire several inotify events for
+	// the same path within milliseconds of each other (e.g. a temp file then
+	// a rename-into-place). Skip repeats of the same path within this window
+	// so one save doesn't become three near-identical DB rows.
+	lastLogged := make(map[string]time.Time)
+	buf := make([]byte, 4096)
+
+	for {
+		n, err := unix.Read(fd, buf)
+		if err != nil {
+			if err == unix.EAGAIN {
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			logError("inotify read error (will retry): %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		offset := 0
+		for offset+int(unix.SizeofInotifyEvent) <= n {
+			raw := (*unix.InotifyEvent)(unsafe.Pointer(&buf[offset]))
+			nameLen := int(raw.Len)
+			var name string
+			if nameLen > 0 && offset+int(unix.SizeofInotifyEvent)+nameLen <= n {
+				nameBytes := buf[offset+int(unix.SizeofInotifyEvent) : offset+int(unix.SizeofInotifyEvent)+nameLen]
+				name = strings.TrimRight(string(nameBytes), "\x00")
+			}
+			dir := watchToDir[raw.Wd]
+			offset += int(unix.SizeofInotifyEvent) + nameLen
+
+			if name == "" || dir == "" {
+				continue
+			}
+
+			fullPath := filepath.Join(dir, name)
+			if t, ok := lastLogged[fullPath]; ok && time.Since(t) < 3*time.Second {
+				continue
+			}
+			lastLogged[fullPath] = time.Now()
+
+			var action string
+			switch {
+			case raw.Mask&unix.IN_CREATE != 0 || raw.Mask&unix.IN_MOVED_TO != 0:
+				action = "created"
+			case raw.Mask&unix.IN_DELETE != 0 || raw.Mask&unix.IN_MOVED_FROM != 0:
+				action = "removed"
+			default:
+				continue
+			}
+			logEvent(db, "file", filepath.Base(dir), fmt.Sprintf("File %s: %s", action, fullPath))
+		}
+	}
+}
 
 func startKeybindTracker(db *sql.DB) {
 	logInfo("Initializing Hyprland keybind tracker...")
@@ -1537,3 +1827,212 @@ func translateKeycode(code uint16) string {
 	return ""
 }
 
+// ---------------- WEB DASHBOARD ----------------
+
+func serveDashboard() {
+	dbPath, _, _, _ := getPaths()
+	db, err := sql.Open("sqlite", dbPath+"?mode=ro")
+	if err != nil {
+		fmt.Printf("%sError opening database: %v%s\n", Red, err, Reset)
+		return
+	}
+	defer db.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) { handleAPIEvents(w, r, db) })
+	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) { handleAPISearch(w, r) })
+	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) { handleAPIStats(w, r, db) })
+
+	sub, _ := fs.Sub(dashboardFS, "dashboard")
+	mux.Handle("/", http.FileServer(http.FS(sub)))
+
+	fmt.Printf("%s%sQareen Dashboard running at http://localhost:%s%s\n", Green, Bold, DashboardPort, Reset)
+	fmt.Printf("Press Ctrl+C to stop.\n")
+	if err := http.ListenAndServe("127.0.0.1:"+DashboardPort, mux); err != nil {
+		fmt.Printf("%sError starting dashboard: %v%s\n", Red, err, Reset)
+	}
+}
+
+func jsonResponse(w http.ResponseWriter, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+func handleAPIEvents(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	q := r.URL.Query()
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	offset, _ := strconv.Atoi(q.Get("offset"))
+	if offset < 0 {
+		offset = 0
+	}
+	filterType := q.Get("type")
+	filterApp := q.Get("app")
+
+	where := ""
+	var args []interface{}
+	var conditions []string
+	if filterType != "" {
+		conditions = append(conditions, "event_type = ?")
+		args = append(args, filterType)
+	}
+	if filterApp != "" {
+		conditions = append(conditions, "app = ?")
+		args = append(args, filterApp)
+	}
+	if len(conditions) > 0 {
+		where = " WHERE " + strings.Join(conditions, " AND ")
+	}
+
+	var total int
+	countQuery := "SELECT COUNT(*) FROM events" + where
+	db.QueryRow(countQuery, args...).Scan(&total)
+
+	query := "SELECT id, timestamp, event_type, app, content FROM events" + where + " ORDER BY id DESC LIMIT ? OFFSET ?"
+	queryArgs := append(args, limit, offset)
+	rows, err := db.Query(query, queryArgs...)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer rows.Close()
+
+	type EventJSON struct {
+		ID        int    `json:"id"`
+		Timestamp string `json:"timestamp"`
+		EventType string `json:"event_type"`
+		App       string `json:"app"`
+		Content   string `json:"content"`
+	}
+	var events []EventJSON
+	for rows.Next() {
+		var ev EventJSON
+		if rows.Scan(&ev.ID, &ev.Timestamp, &ev.EventType, &ev.App, &ev.Content) == nil {
+			events = append(events, ev)
+		}
+	}
+	if events == nil {
+		events = []EventJSON{}
+	}
+	jsonResponse(w, map[string]interface{}{"events": events, "total": total})
+}
+
+func handleAPISearch(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query().Get("q")
+	if q == "" {
+		http.Error(w, "missing query parameter 'q'", 400)
+		return
+	}
+	k := 12
+	if kStr := r.URL.Query().Get("k"); kStr != "" {
+		if kVal, err := strconv.Atoi(kStr); err == nil && kVal > 0 {
+			k = kVal
+		}
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{"query": q, "k": k})
+	resp, err := http.Post(ServerURL+"/search", "application/json", bytes.NewBuffer(payload))
+	if err != nil {
+		http.Error(w, "search service unavailable: "+err.Error(), 502)
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(body)
+}
+
+func handleAPIStats(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	type LabelCount struct {
+		Label string `json:"label"`
+		Count int    `json:"count"`
+	}
+	type HourCount struct {
+		Hour  int `json:"hour"`
+		Count int `json:"count"`
+	}
+	type DayCount struct {
+		Date  string `json:"date"`
+		Count int    `json:"count"`
+	}
+
+	var total, today, thisWeek, uniqueApps int
+	db.QueryRow("SELECT COUNT(*) FROM events").Scan(&total)
+	db.QueryRow("SELECT COUNT(*) FROM events WHERE timestamp >= date('now')").Scan(&today)
+	db.QueryRow("SELECT COUNT(*) FROM events WHERE timestamp >= date('now', '-7 days')").Scan(&thisWeek)
+	db.QueryRow("SELECT COUNT(DISTINCT app) FROM events").Scan(&uniqueApps)
+
+	var byType []LabelCount
+	rows, _ := db.Query("SELECT event_type, COUNT(*) as cnt FROM events GROUP BY event_type ORDER BY cnt DESC")
+	if rows != nil {
+		defer rows.Close()
+		for rows.Next() {
+			var lc LabelCount
+			if rows.Scan(&lc.Label, &lc.Count) == nil {
+				byType = append(byType, lc)
+			}
+		}
+	}
+
+	var topApps []LabelCount
+	rows2, _ := db.Query("SELECT app, COUNT(*) as cnt FROM events GROUP BY app ORDER BY cnt DESC LIMIT 20")
+	if rows2 != nil {
+		defer rows2.Close()
+		for rows2.Next() {
+			var lc LabelCount
+			if rows2.Scan(&lc.Label, &lc.Count) == nil {
+				topApps = append(topApps, lc)
+			}
+		}
+	}
+
+	byHour := make([]HourCount, 24)
+	for i := range byHour {
+		byHour[i].Hour = i
+	}
+	rows3, _ := db.Query("SELECT CAST(strftime('%H', timestamp) AS INTEGER) as h, COUNT(*) FROM events GROUP BY h ORDER BY h")
+	if rows3 != nil {
+		defer rows3.Close()
+		for rows3.Next() {
+			var h, c int
+			if rows3.Scan(&h, &c) == nil && h >= 0 && h < 24 {
+				byHour[h].Count = c
+			}
+		}
+	}
+
+	var byDay []DayCount
+	rows4, _ := db.Query("SELECT date(timestamp) as d, COUNT(*) FROM events WHERE timestamp >= date('now', '-30 days') GROUP BY d ORDER BY d")
+	if rows4 != nil {
+		defer rows4.Close()
+		for rows4.Next() {
+			var dc DayCount
+			if rows4.Scan(&dc.Date, &dc.Count) == nil {
+				byDay = append(byDay, dc)
+			}
+		}
+	}
+
+	if byType == nil {
+		byType = []LabelCount{}
+	}
+	if topApps == nil {
+		topApps = []LabelCount{}
+	}
+	if byDay == nil {
+		byDay = []DayCount{}
+	}
+
+	jsonResponse(w, map[string]interface{}{
+		"total":       total,
+		"today":       today,
+		"this_week":   thisWeek,
+		"unique_apps": uniqueApps,
+		"by_type":     byType,
+		"top_apps":    topApps,
+		"by_hour":     byHour,
+		"by_day":      byDay,
+	})
+}

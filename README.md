@@ -1,11 +1,20 @@
+---
+mainfont: "Open Sans"
+---
+
 # Qareen — Personal Digital Twin
 
 Qareen logs your own local activity (shell commands, active window/browser
-titles, Firefox history, WhatsApp Web / ChatGPT / Google Meet text via a
-companion extension, and system journal errors), embeds each event, and
-lets you later ask "how did I fix X before?" — it retrieves the most
-semantically relevant past events and asks an LLM (Groq) to summarize the
-steps you took.
+titles, Firefox history, WhatsApp Web / ChatGPT / Claude / Gemini / Grok /
+Google Meet text via a companion extension, system journal errors, desktop
+notifications, and file creation/deletion in your Downloads/Documents/Desktop),
+embeds each event, and lets you later ask "how did I fix X before?" — it
+retrieves the most semantically relevant past events and asks an LLM (Groq)
+to summarize the steps you took.
+
+Requires `dbus` (for the `dbus-monitor` binary used to perceive desktop
+notifications) in addition to the Python/Go dependencies below - this is
+already installed on virtually all Linux desktops.
 
 ## Components
 
@@ -73,6 +82,52 @@ Press the keybind, type a question, and the answer comes back from the same
 memory-timeline + Groq pipeline `qareen query` uses - so it's logged back
 into your history just the same.
 
+## Fixed in this update
+
+- **`qareen start` no longer dies silently if the Python embedding server
+  fails to launch.** Previously a missing `~/venv` (or any embedding-server
+  startup error) made `startDaemon()` return early, so shell/window/browser/
+  log tracking never started either — not just embeddings. Now the Go
+  tracking daemon always starts; a broken embedding server only disables
+  embeddings, `qareen query`, and browser-extension logging, and prints a
+  clear warning explaining why and how to fix it.
+- **Claude/Gemini/Grok prompts are now labeled like ChatGPT's.** `embedding_server.py`'s
+  `/log-web` handler previously only had special formatting for `chatgpt`/
+  `whatsapp`/`google-meet`; everything else (including Claude, Gemini, and
+  Grok) fell into a generic, context-free `"Web event on {site}: ..."`. Now
+  all four AI assistants get matching `"Prompted X in conversation '...':"` /
+  `"X replied in conversation '...':"` formatting, so a stored event
+  unambiguously shows whether it was something you typed or the AI's reply.
+- **Title-based fallback now recognizes Claude/Gemini/Grok too.** If the
+  browser extension isn't installed/running, `main.go`'s active-window title
+  matching previously only recognized WhatsApp/ChatGPT/Google tabs. It now
+  also tags Claude, Gemini, and Grok tabs instead of logging them as a
+  generic window-title change.
+- **Fixed a broken chess.com selector in `content.js`** (`'input[placeholder*="chat" Tint]'`
+  was invalid CSS and threw a `DOMException` whenever the primary selector
+  missed). Replaced with a valid case-insensitive attribute selector.
+
+## New: desktop notifications & file perception
+
+- **Desktop notifications** are now tracked via `dbus-monitor` eavesdropping
+  on `org.freedesktop.Notifications.Notify` — this works for dunst, mako,
+  swaync, or any other DBus-compliant notification daemon, with no
+  daemon-specific integration needed. See `startNotificationWatcher()` in
+  `main.go`. Requires the `dbus` package (specifically the `dbus-monitor`
+  binary) to be installed; if it's missing, this tracker logs a warning
+  once and the rest of Qareen is unaffected.
+- **File creation/deletion** in `~/Downloads`, `~/Documents`, and `~/Desktop`
+  is now tracked via inotify (`golang.org/x/sys/unix`, no new third-party
+  dependency). See `startFileWatcher()` in `main.go`. Directories that don't
+  exist on your system are skipped silently; if none of the three exist,
+  this tracker logs a warning once and the rest of Qareen is unaffected.
+  Content is not read or embedded from these files — only the fact that a
+  file appeared or disappeared, and its path, is logged.
+- After pulling these changes, run `go mod tidy` once (with normal internet
+  access) before `go build` — `golang.org/x/sys` moved from an indirect to a
+  direct dependency in `go.mod` since the file watcher now imports it
+  directly.
+
 ## Known limitations / ideas for next steps
 
 - **No encryption at rest.** `~/.qareen.db` holds a very sensitive record of
@@ -92,6 +147,17 @@ into your history just the same.
   and restart on crash automatically.
 - **No retry/backoff on the Groq streaming call.** A flaky connection just
   fails the query outright.
+- **File watcher is non-recursive.** `startFileWatcher()` watches
+  `~/Downloads`, `~/Documents`, and `~/Desktop` themselves but not their
+  subdirectories. Extending this to subfolders would mean walking the tree
+  and adding a watch per subdirectory (and handling new subdirectories
+  created afterward), which was left out for now to keep resource usage
+  predictable.
+- **Notification eavesdropping depends on session bus policy.** Some
+  hardened DBus configurations restrict `eavesdrop='true'` match rules to
+  privileged processes. If `dbus-monitor` starts but no notifications ever
+  get logged, check your session bus policy (this is not restricted by
+  default on typical desktop distros).
 - **Recording other people's messages/captions.** The extension logs
   incoming WhatsApp messages and Google Meet captions from other
   participants, not just your own. That's worth being deliberate about —

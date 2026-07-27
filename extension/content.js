@@ -128,7 +128,7 @@ document.addEventListener('keydown', (e) => {
                 if (text) setTimeout(() => sendWebLog(site, target, text, "You"), 200);
             }
         } else if (host.includes("chess.com")) {
-            const chatInput = document.querySelector('.chat-input-input') || document.querySelector('input[placeholder*="chat" Tint]');
+            const chatInput = document.querySelector('.chat-input-input') || document.querySelector('input[placeholder*="chat" i]');
             if (chatInput && targetEl === chatInput) {
                 text = chatInput.value;
                 site = "chess";
