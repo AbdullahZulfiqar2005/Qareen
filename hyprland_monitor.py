@@ -1,11 +1,13 @@
+import argparse
 import os
 import sys
 import time
-import argparse
+
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
-from qareen_embeddings import RemoteEmbeddings
+
 from qareen_dotenv import load_dotenv
+from qareen_embeddings import RemoteEmbeddings
 
 load_dotenv()
 
@@ -28,7 +30,7 @@ RESET = "\033[0m"
 
 # Print banner
 print(f"{BLUE}{BOLD}==================================================")
-print(f"      ❄️  HYPRLAND DIAGNOSTIC & MONITORING AGENT")
+print("      ❄️  HYPRLAND DIAGNOSTIC & MONITORING AGENT")
 print(f"=================================================={RESET}")
 
 _retriever_cache = None

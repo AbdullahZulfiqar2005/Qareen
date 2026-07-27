@@ -1,12 +1,14 @@
 import os
-import sys
 import subprocess
+import sys
+
 from langchain_community.vectorstores import FAISS
-from langchain_groq import ChatGroq
 from langchain_core.tools import tool
+from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
-from qareen_embeddings import RemoteEmbeddings
+
 from qareen_dotenv import load_dotenv
+from qareen_embeddings import RemoteEmbeddings
 
 load_dotenv()
 
@@ -29,7 +31,7 @@ RESET = "\033[0m"
 
 # Print banner
 print(f"{BLUE}{BOLD}==================================================")
-print(f"      🧙‍♂️ ARCH-SAGE: AGENTIC SYSTEM TROUBLESHOOTER")
+print("      🧙‍♂️ ARCH-SAGE: AGENTIC SYSTEM TROUBLESHOOTER")
 print(f"=================================================={RESET}")
 
 print(f"{GREEN}[System] Connecting to local embedding server and loading FAISS vector index...{RESET}")

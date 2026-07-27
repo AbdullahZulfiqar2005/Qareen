@@ -34,8 +34,7 @@ def load_dotenv():
                     line = raw_line.strip()
                     if not line or line.startswith("#"):
                         continue
-                    if line.startswith("export "):
-                        line = line[len("export "):]
+                    line = line.removeprefix("export ")
                     if "=" not in line:
                         continue
                     key, _, val = line.partition("=")

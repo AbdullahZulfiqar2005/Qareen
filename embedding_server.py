@@ -1,14 +1,15 @@
-import os
+import datetime
 import json
+import os
+import sqlite3
 import struct
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 import lz4.block
-import sqlite3
-import datetime
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
 
 # GROQ_API_KEY is only needed by chat.py / hyprland_monitor.py / main.go, not
 # by this server (it never calls Groq itself). We intentionally do NOT set a

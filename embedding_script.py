@@ -1,8 +1,8 @@
-from tqdm import tqdm
-from langchain_community.document_loaders import DirectoryLoader, BSHTMLLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.document_loaders import BSHTMLLoader, DirectoryLoader
 from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from tqdm import tqdm
 
 WIKI_PATH = "/usr/share/doc/arch-wiki/html/en"
 
