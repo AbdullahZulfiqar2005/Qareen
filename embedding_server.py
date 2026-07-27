@@ -50,8 +50,8 @@ if os.path.exists(WIKI_INDEX_PATH):
     try:
         _wiki_store = FAISS.load_local(WIKI_INDEX_PATH, model, allow_dangerous_deserialization=True)
         print("Arch Wiki FAISS index loaded successfully.")
-    except Exception as e:
-        print(f"Warning: Failed to load Arch Wiki FAISS index: {str(e)}")
+    except Exception as e:  # noqa: BLE001
+        print(f"Warning: Failed to load Arch Wiki FAISS index: {e!s}")
 
 # --- Event FAISS Index ---
 EVENT_INDEX_PATH = os.path.expanduser("~/.qareen_event_index")
@@ -88,7 +88,7 @@ def _load_or_build_event_index():
                     _last_indexed_id = meta.get("last_indexed_id", 0)
             print(f"Event index loaded (last_indexed_id={_last_indexed_id}).")
             return
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Warning: Failed to load event index, rebuilding: {e}")
 
     print("Building event FAISS index from database...")
@@ -240,7 +240,7 @@ def _background_index_saver():
             if _event_index_dirty:
                 try:
                     _save_event_index()
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     print(f"Warning: Failed to save event index: {e}")
 
 
@@ -281,11 +281,7 @@ def format_web_event(site, target, content, sender):
         return f"Sent LinkedIn message to {target}: {content}"
     elif site == "instagram":
         return f"Sent Instagram DM to {target}: {content}"
-    elif site == "reddit":
-        return content
-    elif site == "github":
-        return content
-    elif site == "gmail":
+    elif site == "reddit" or site == "github" or site == "gmail":
         return content
     else:
         return f"Web event on {site}: {content}"
@@ -297,9 +293,8 @@ def find_firefox_profile():
         return None
     for name in os.listdir(base_dir):
         profile_path = os.path.join(base_dir, name)
-        if os.path.isdir(profile_path) and os.path.exists(os.path.join(profile_path, "places.sqlite")):
-            if "default-release" in name:
-                return profile_path
+        if os.path.isdir(profile_path) and os.path.exists(os.path.join(profile_path, "places.sqlite")) and "default-release" in name:
+            return profile_path
     for name in os.listdir(base_dir):
         profile_path = os.path.join(base_dir, name)
         if os.path.isdir(profile_path) and os.path.exists(os.path.join(profile_path, "places.sqlite")):
@@ -340,11 +335,11 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({'embeddings': embeddings}).encode('utf-8'))
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 self.send_response(500)
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                self.wfile.write(f"Error: {str(e)}".encode('utf-8'))
+                self.wfile.write(f"Error: {e!s}".encode())
                 
         elif self.path == '/wiki-search':
             try:
@@ -369,11 +364,11 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({'results': results}).encode('utf-8'))
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 self.send_response(500)
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                self.wfile.write(f"Error: {str(e)}".encode('utf-8'))
+                self.wfile.write(f"Error: {e!s}".encode())
                 
         elif self.path == '/search':
             try:
@@ -414,11 +409,11 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({'results': results}).encode('utf-8'))
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 self.send_response(500)
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                self.wfile.write(f"Error: {str(e)}".encode('utf-8'))
+                self.wfile.write(f"Error: {e!s}".encode())
 
         elif self.path == '/log-web':
             try:
@@ -438,7 +433,7 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                     self.wfile.write(b"Error: 'site' and 'content' cannot be empty.")
                     return
                 
-                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                timestamp = datetime.datetime.now(datetime.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
                 db_content = format_web_event(site, target, content, sender)
                 
                 # Generate embedding based on the descriptive event
@@ -470,11 +465,11 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
                 self.wfile.write(b'{"status": "success"}')
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 self.send_response(500)
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                self.wfile.write(f"Error: {str(e)}".encode('utf-8'))
+                self.wfile.write(f"Error: {e!s}".encode())
         else:
             self.send_response(404)
             self.end_headers()
@@ -528,11 +523,11 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                         self.send_header('Access-Control-Allow-Origin', '*')
                         self.end_headers()
                         self.wfile.write(b"Error: Invalid Firefox session file magic bytes.")
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 self.send_response(500)
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                self.wfile.write(f"Error: {str(e)}".encode('utf-8'))
+                self.wfile.write(f"Error: {e!s}".encode())
         else:
             self.send_response(404)
             self.end_headers()

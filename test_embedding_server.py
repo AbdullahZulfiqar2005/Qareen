@@ -1,5 +1,6 @@
 import struct
-from embedding_server import pack_embedding, format_web_event
+
+from embedding_server import format_web_event, pack_embedding
 
 
 class TestPackEmbedding:

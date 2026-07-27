@@ -69,8 +69,8 @@ def read_system_file(file_path: str, start_line: int = 1, num_lines: int = 50) -
         selected_lines = lines[start_idx:end_idx]
         content = "".join(selected_lines)
         return f"Showing lines {start_idx + 1}-{end_idx} of {total_lines} in {file_path}:\n\n{content}"
-    except Exception as e:
-        return f"Error reading file {file_path}: {str(e)}"
+    except OSError as e:
+        return f"Error reading file {file_path}: {e!s}"
 
 @tool
 def run_diagnostic(command: str) -> str:
@@ -79,7 +79,7 @@ def run_diagnostic(command: str) -> str:
     Do NOT use this for writing files, restarting services, or applying modifications."""
     print(f"\n⚡ {YELLOW}[Diagnostic Run]{RESET} {command}")
     try:
-        res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=10)
+        res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=10, check=False)
         output = f"Exit code: {res.returncode}\n"
         if res.stdout:
             output += f"Stdout:\n{res.stdout}\n"
@@ -88,8 +88,8 @@ def run_diagnostic(command: str) -> str:
         return output
     except subprocess.TimeoutExpired:
         return "Error: Command timed out after 10 seconds."
-    except Exception as e:
-        return f"Error executing command: {str(e)}"
+    except (subprocess.SubprocessError, OSError) as e:
+        return f"Error executing command: {e!s}"
 
 @tool
 def apply_fix(command: str) -> str:
@@ -97,7 +97,7 @@ def apply_fix(command: str) -> str:
     Always prompts the user for manual confirmation before execution.
     Use this tool to apply corrective changes after diagnostics suggest a clear fix."""
     print(f"\n⚠️  {RED}[SAFETY CONFIRMATION REQUIRED]{RESET}")
-    print(f"   The agent wants to execute the following command to apply a fix:")
+    print("   The agent wants to execute the following command to apply a fix:")
     print(f"   👉 {YELLOW}{BOLD}{command}{RESET}")
     try:
         confirm = input("   Approve execution? (y/N): ").strip().lower()
@@ -107,7 +107,7 @@ def apply_fix(command: str) -> str:
     if confirm == 'y':
         print(f"⚡ {GREEN}[Executing Fix]{RESET}...")
         try:
-            res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=15)
+            res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=15, check=False)
             output = f"Exit code: {res.returncode}\n"
             if res.stdout:
                 output += f"Stdout:\n{res.stdout}\n"
@@ -116,8 +116,8 @@ def apply_fix(command: str) -> str:
             return output
         except subprocess.TimeoutExpired:
             return "Error: Command timed out after 15 seconds."
-        except Exception as e:
-            return f"Error executing command: {str(e)}"
+        except (subprocess.SubprocessError, OSError) as e:
+            return f"Error executing command: {e!s}"
     else:
         print(f"❌ {RED}[Execution Cancelled by User]{RESET}")
         return "Error: Command was rejected by the user. Please formulate an alternative solution."
@@ -180,5 +180,5 @@ while True:
                     if len(content_str) > 1000:
                         content_str = content_str[:1000] + "\n... (truncated for readability)"
                     print(f"\n📦 {GREEN}[Tool Result]{RESET} from '{msg.name}':\n{content_str}")
-    except Exception as e:
-        print(f"\n❌ {RED}[Agent Execution Error]{RESET} {str(e)}")
+    except Exception as e:  # noqa: BLE001
+        print(f"\n❌ {RED}[Agent Execution Error]{RESET} {e!s}")

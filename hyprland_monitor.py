@@ -88,8 +88,8 @@ def analyze_failure(log_path, log_type):
     try:
         with open(log_path, 'r', errors='replace') as f:
             lines = f.readlines()
-    except Exception as e:
-        print(f"{RED}Error reading file: {str(e)}{RESET}")
+    except OSError as e:
+        print(f"{RED}Error reading file: {e!s}{RESET}")
         return
 
     critical_context = ""
