@@ -1,5 +1,4 @@
 import struct
-import math
 from embedding_server import pack_embedding, format_web_event
 
 

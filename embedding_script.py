@@ -1,5 +1,4 @@
-import os
-from tqdm import tqdm # Isse progress bar dikhayega
+from tqdm import tqdm
 from langchain_community.document_loaders import DirectoryLoader, BSHTMLLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
