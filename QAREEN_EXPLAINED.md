@@ -200,15 +200,17 @@ A Manifest V3 content script injected into every webpage. It captures user inter
 | ChatGPT | User prompts + assistant responses (with streaming completion detection) |
 | Claude | User prompts + responses (`.font-claude-message`) |
 | Gemini | User prompts + responses (`message-content` elements) |
-| Grok | User prompts (x.com/grok and grok.com) |
-| WhatsApp Web | Outgoing + incoming messages (with sender identification and group detection) |
+| Grok | User prompts & responses (`.markdown` element turns on grok.com) |
+| Groq Playground | User prompts & responses (`[data-role="assistant"]` elements on console.groq.com) |
+| WhatsApp Web | Outgoing + incoming messages (with self-learning identity name heuristics, checkmarks, and data-id verification) |
 | Gmail | Sent emails (to/subject/body) + read emails (on URL change) |
 | LinkedIn | Sent DMs + viewed feed posts |
 | Instagram | Sent DMs + viewed posts/reels |
 | Reddit | Viewed posts + submitted comments |
 | GitHub | Repo visits, file views, PR/issue views, submitted comments |
 | Google Meet | Closed captions with speaker identification and sentence boundary detection |
-| Chess.com | Game starts, move lists, chat messages |
+| Chess.com | Game starts, move lists, chat messages, and final game outcomes (Won, Lost, Draw) |
+| Lichess.org | Game starts, opponent names, and final game outcomes (victorious/defeat/mate/resign/draw) |
 
 **Safety features:**
 - `isSensitiveInput()` — skips password, card, CVV, SSN, token, key, and secret fields
@@ -419,6 +421,34 @@ go build -o qareen .
 
 ---
 
+## Recent Core Updates (July 2026)
+
+### 1. Systemd User Space Integration
+We migrated both Qareen service processes to systemd user space:
+- **`qareen.service`**: Systemd user unit that executes the Go daemon (`qareen run-daemon`) and imports the graphical/Wayland environment variables (required for Hyprland/DBus monitor hooks).
+- **`qareen-embedding.service`**: User unit that manages the local Python server.
+- **PID File Compatibility**: The Go CLI status tracker connects seamlessly with systemd user processes by checking the standard `/tmp/qareend.pid` and `/tmp/qareen_py.pid` lock files.
+
+### 2. PyTorch Memory Optimization
+Standard SentenceTransformer setups can occupy upwards of 950MB of RAM. We reduced this active RSS consumption to **under 399MB** using the following low-resource optimizations:
+- **AUTOGRAD Disable**: Disabled PyTorch autograd gradients (`torch.set_grad_enabled(False)`).
+- **Thread Capping**: Overrode PyTorch default CPU thread-pooling behavior (`OMP_NUM_THREADS=1` and `torch.set_num_threads(1)`).
+- **GPU Hiding**: Hid CUDA resources using environment flags (`CUDA_VISIBLE_DEVICES=""`).
+- **Resource Constraints**: Capped systemd memory usage configurations (`MemoryHigh=400M`, `MemoryMax=450M`).
+
+### 3. Dynamic Browser Scraping Mechanics
+- **Self-Learning User Identity (WhatsApp)**: Outgoing messages on WhatsApp Web no longer display your name above the bubble (they align to the right), and the `.message-out` class is gone. The extension implements a self-learning heuristic: it saves the text and timestamp of the inputs you type, matches them to new DOM bubbles, and dynamically learns your profile identity name.
+- **Access Checkmark Status**: Identifies outgoing messages via unique message metadata (`data-id` prefixes starting with `true_`) and checkmark status icons (`msg-check`, `msg-doublecheck-ack`, `msg-time`).
+- **Group Tooltip Exclusions**: Excludes group configuration tooltips like `"click here for group info"` from contact/group name parsing.
+- **AI Prompt Interceptors**: Bypasses textarea checks on ChatGPT/console.groq.com and uses fallback `.value || .innerText || ""` selectors to successfully grab prompt queries on contenteditable input elements.
+- **Chess Gameplay Outcomes**: Runs periodic status checkers to capture finished match results (victory, defeat, mate, resignations, draws) exactly once per game on both Chess.com and Lichess.org.
+
+### 4. Temporal Query Routing & Terminal CLI UI
+- **Hybrid Query Routing**: When the user query contains temporal keywords (like "today", "yesterday", "last 2 hours", "summarize my day"), the Python search router fetches chronological logs from SQLite directly, giving the LLM 100% accurate context for your daily timeline instead of retrieving semantically close older queries.
+- **Styled Command Output**: Refactored `qareen query` terminal output to display a polished timeline showing tree branches (`├──`, `└──`) and emojis representing each category, and automatically indents streamed digital twin answers on the left.
+
+---
+
 ## External Dependencies
 
 | Dependency | What For | Scope |
@@ -484,7 +514,6 @@ node --test extension/test_content.test.js
 ## What I'd Add Next
 
 1. **Encryption at rest** — the database contains highly sensitive personal data
-2. **Retention policies** — `qareen prune` command with configurable age limits
-3. **Systemd service unit** — proper Linux service management instead of manual PID files
-4. **Cross-platform support** — fallback trackers for GNOME, KDE, Sway, macOS
-5. **Plugin architecture for scrapers** — declarative config instead of hardcoded DOM selectors
+2. **Retention policies** — `qareen prune & clean` commands with age limits
+3. **Cross-platform support** — fallback trackers for GNOME, KDE, Sway, macOS
+4. **Plugin architecture for scrapers** — declarative config instead of hardcoded DOM selectors

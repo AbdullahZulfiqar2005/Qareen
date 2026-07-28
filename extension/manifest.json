@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Qareen Companion",
-  "version": "1.0",
+  "version": "1.2",
   "description": "Companion extension to log all browser interactions, inputs, and meeting transcripts for Qareen digital twin.",
   "permissions": [
     "activeTab"
@@ -14,12 +14,16 @@
       "matches": [
         "<all_urls>"
       ],
-      "js": ["content.js"],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_end"
     }
   ],
   "background": {
-    "scripts": ["background.js"]
+    "scripts": [
+      "background.js"
+    ]
   },
   "browser_specific_settings": {
     "gecko": {
@@ -33,5 +37,3 @@
     }
   }
 }
-
-

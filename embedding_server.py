@@ -1,15 +1,46 @@
-import datetime
-import json
 import os
+
+# --- Memory & Threading Optimizations ---
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+import atexit
+import datetime
+import gc
+import json
 import sqlite3
 import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# Write PID file for status tracking compatibility
+try:
+    with open("/tmp/qareen_py.pid", "w") as f:
+        f.write(str(os.getpid()))
+except Exception as e:  # noqa: BLE001
+    print(f"Warning: Failed to write PID file: {e}")
+
+@atexit.register
+def cleanup_pid():
+    try:
+        os.remove("/tmp/qareen_py.pid")
+    except OSError:
+        pass
+
 import lz4.block
+import torch
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
+
+# Force CPU execution parameters
+torch.set_num_threads(1)
+if hasattr(torch, "set_grad_enabled"):
+    torch.set_grad_enabled(False)
 
 # GROQ_API_KEY is only needed by chat.py / hyprland_monitor.py / main.go, not
 # by this server (it never calls Groq itself). We intentionally do NOT set a
@@ -21,6 +52,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 
 print("Loading sentence-transformer embedding model...")
 model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+gc.collect()
 print("Model loaded successfully. Starting embedding server on 127.0.0.1:2846...")
 
 DB_PATH = os.path.expanduser("~/.qareen.db")
@@ -258,7 +290,7 @@ def pack_embedding(embedding):
 
 def format_web_event(site, target, content, sender):
     """Format a browser extension event into a human-readable string for storage."""
-    ai_site_names = {"chatgpt": "ChatGPT", "claude": "Claude", "gemini": "Gemini", "grok": "Grok"}
+    ai_site_names = {"chatgpt": "ChatGPT", "claude": "Claude", "gemini": "Gemini", "grok": "Grok", "groq": "Groq"}
     if site in ai_site_names:
         pretty = ai_site_names[site]
         response_prefix = f"{pretty} response: "
@@ -300,6 +332,44 @@ def find_firefox_profile():
         if os.path.isdir(profile_path) and os.path.exists(os.path.join(profile_path, "places.sqlite")):
             return profile_path
     return None
+
+def _is_temporal_query(query):
+    q = query.lower().strip()
+    keywords = [
+        "today", "yesterday", "last hour", "last 1 hour", "last 2 hours", 
+        "last 3 hours", "last 4 hours", "last 5 hours", "last 12 hours",
+        "last 24 hours", "last 30 mins", "last 30 minutes", "summarize my day",
+        "what did i do today", "activity today", "what i did today"
+    ]
+    return any(kw in q for kw in keywords)
+
+def _get_temporal_start_time(query):
+    q = query.lower().strip()
+    # Use localized local timezone aware datetime
+    now = datetime.datetime.now(datetime.timezone.utc).astimezone()
+    
+    if "yesterday" in q:
+        yesterday = now - datetime.timedelta(days=1)
+        return yesterday.replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+    elif "last hour" in q or "last 1 hour" in q:
+        return (now - datetime.timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    elif "last 2 hours" in q:
+        return (now - datetime.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+    elif "last 3 hours" in q:
+        return (now - datetime.timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+    elif "last 4 hours" in q:
+        return (now - datetime.timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S")
+    elif "last 5 hours" in q:
+        return (now - datetime.timedelta(hours=5)).strftime("%Y-%m-%d %H:%M:%S")
+    elif "last 12 hours" in q:
+        return (now - datetime.timedelta(hours=12)).strftime("%Y-%m-%d %H:%M:%S")
+    elif "last 24 hours" in q:
+        return (now - datetime.timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    elif "last 30 min" in q:
+        return (now - datetime.timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        # Default to start of today
+        return now.replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
 
 class EmbeddingHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
@@ -390,7 +460,25 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                     _sync_new_events()
 
                 results = []
-                if _event_store is not None:
+                if _is_temporal_query(query):
+                    start_time = _get_temporal_start_time(query)
+                    print(f"[Search Router] Temporal query detected. Fetching events since: {start_time}")
+                    with _db_lock:
+                        cursor = _db_conn.execute(
+                            "SELECT id, timestamp, event_type, app, content FROM events WHERE timestamp >= ? ORDER BY timestamp DESC LIMIT 40",
+                            (start_time,)
+                        )
+                        rows = cursor.fetchall()
+                    for r_id, r_time, r_type, r_app, r_content in rows:
+                        results.append({
+                            'event_id': r_id,
+                            'timestamp': r_time,
+                            'event_type': r_type,
+                            'app': r_app,
+                            'content': r_content,
+                            'score': 1.0,
+                        })
+                elif _event_store is not None:
                     with _event_index_lock:
                         docs_and_scores = _event_store.similarity_search_with_score(query, k=k)
                     for doc, score in docs_and_scores:

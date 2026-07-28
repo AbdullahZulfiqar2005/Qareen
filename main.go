@@ -45,12 +45,15 @@ var dashboardFS embed.FS
 
 // ANSI Colors
 const (
-	Blue   = "\033[94m"
-	Green  = "\033[92m"
-	Yellow = "\033[93m"
-	Red    = "\033[91m"
-	Bold   = "\033[1m"
-	Reset  = "\033[0m"
+	Blue    = "\033[94m"
+	Green   = "\033[92m"
+	Yellow  = "\033[93m"
+	Red     = "\033[91m"
+	Magenta = "\033[95m"
+	Cyan    = "\033[96m"
+	Gray    = "\033[90m"
+	Bold    = "\033[1m"
+	Reset   = "\033[0m"
 )
 
 type Event struct {
@@ -376,7 +379,9 @@ func statusDaemon() {
 // ---------------- DAEMON RUN LOOP ----------------
 
 func runDaemonLoop() {
-	dbPath, _, _, _ := getPaths()
+	dbPath, daemonPidPath, _, _ := getPaths()
+	os.WriteFile(daemonPidPath, []byte(strconv.Itoa(os.Getpid())), 0644)
+	defer os.Remove(daemonPidPath)
 
 	// Setup database
 	db, err := sql.Open("sqlite", dbPath)
@@ -876,11 +881,8 @@ func queryDaemon(queryText string) {
 	}
 	wikiContext := wikiBuilder.String()
 
-	fmt.Printf("\n%s%s🕵️‍♂️ Qareen: Scanning your memory timeline...%s\n", Blue, Bold, Reset)
-	fmt.Printf("%s[Timeline Context Retrieved (Top Semantic Matches)]%s\n", Yellow, Reset)
-	fmt.Println(timeline)
-	fmt.Printf("%s==================================================%s\n", Blue, Reset)
-	fmt.Printf("%s🧠 Generating guidance from your digital twin...%s\n\n", Green, Reset)
+	printStyledTimeline(topMatches)
+	fmt.Printf("%s🧠 Generating guidance from your digital twin...%s\n", Green, Reset)
 
 	// Stream guidance response from Groq
 	err = queryGroqLLM(queryText, timeline, wikiContext)
@@ -968,6 +970,11 @@ func queryGroqLLM(query, timeline, wikiContext string) error {
 		return fmt.Errorf("HTTP error %d: %s", resp.StatusCode, string(body))
 	}
 
+	fmt.Printf("\n%s%s┌──────────────────────────────────────────────────────────┐%s\n", Green, Bold, Reset)
+	fmt.Printf("%s%s│                 🧠 DIGITAL TWIN GUIDANCE                 │%s\n", Green, Bold, Reset)
+	fmt.Printf("%s%s└──────────────────────────────────────────────────────────┘%s\n", Green, Bold, Reset)
+	fmt.Print("  ")
+
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -986,13 +993,89 @@ func queryGroqLLM(query, timeline, wikiContext string) error {
 			}
 			if err := json.Unmarshal([]byte(dataStr), &chunk); err == nil {
 				if len(chunk.Choices) > 0 {
-					fmt.Print(chunk.Choices[0].Delta.Content)
+					content := chunk.Choices[0].Delta.Content
+					indented := strings.ReplaceAll(content, "\n", "\n  ")
+					fmt.Print(indented)
 				}
 			}
 		}
 	}
-	fmt.Println()
+	fmt.Println("\n")
 	return nil
+}
+
+func printStyledTimeline(topMatches []SimilarityMatch) {
+	fmt.Printf("\n%s%s┌──────────────────────────────────────────────────────────┐%s\n", Blue, Bold, Reset)
+	fmt.Printf("%s%s│             🗓️  QAREEN DIGITAL TWIN TIMELINE              │%s\n", Blue, Bold, Reset)
+	fmt.Printf("%s%s└──────────────────────────────────────────────────────────┘%s\n", Blue, Bold, Reset)
+	
+	if len(topMatches) == 0 {
+		fmt.Printf("  %s(No events recorded in this time window)%s\n", Gray, Reset)
+		return
+	}
+
+	for i, m := range topMatches {
+		tStr := m.Event.Timestamp
+		if len(tStr) > 19 {
+			tStr = tStr[:19]
+		}
+		timePart := tStr
+		if len(tStr) >= 19 {
+			timePart = tStr[11:16]
+		}
+		
+		icon := "🔵"
+		typeColor := Cyan
+		switch strings.ToLower(m.Event.Type) {
+		case "whatsapp":
+			icon = "💬"
+			typeColor = Green
+		case "chatgpt":
+			icon = "🤖"
+			typeColor = Magenta
+		case "command", "history":
+			icon = "💻"
+			typeColor = Yellow
+		case "tab", "browse":
+			icon = "🌐"
+			typeColor = Blue
+		case "gmail":
+			icon = "📧"
+			typeColor = Red
+		case "meet":
+			icon = "🎥"
+			typeColor = Red
+		case "query":
+			icon = "🕵️‍♂️"
+			typeColor = Cyan
+		}
+
+		branch := "├──"
+		if i == len(topMatches)-1 {
+			branch = "└──"
+		}
+
+		appStr := m.Event.App
+		if appStr == "" {
+			appStr = "system"
+		}
+
+		fmt.Printf("  %s%s %s [%s] %s%s%s • %s\n", 
+			Gray, branch, icon, timePart, typeColor, strings.ToUpper(m.Event.Type), Reset, appStr)
+		
+		indentBranch := "  │  "
+		if i == len(topMatches)-1 {
+			indentBranch = "     "
+		}
+		
+		contentStr := strings.TrimSpace(m.Event.Content)
+		if len(contentStr) > 120 {
+			contentStr = contentStr[:117] + "..."
+		}
+		
+		fmt.Printf("  %s%s %s%s%s\n", Gray, indentBranch, Reset, contentStr, Reset)
+	}
+	fmt.Printf("\n")
 }
 
 // ---------------- UTILITIES & HELPERS ----------------
