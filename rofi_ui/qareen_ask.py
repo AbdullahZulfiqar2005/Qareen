@@ -24,10 +24,9 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from qareen_dotenv import load_dotenv  # noqa: E402
+from qareen_dotenv import load_dotenv
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 GUIDANCE_MARKER = "Generating guidance from your digital twin"
@@ -38,17 +37,17 @@ def strip_ansi(text: str) -> str:
     return ANSI_RE.sub("", text)
 
 
-def find_qareen_binary() -> Optional[str]:
-    # Prefer whatever's on $PATH (matches README's `sudo mv qareen
-    # /usr/local/bin/` install step); fall back to a binary sitting next to
-    # this repo in case the user hasn't installed it system-wide yet.
-    on_path = shutil.which("qareen")
-    if on_path:
-        return on_path
+def find_qareen_binary() -> str | None:
+    # Prefer the local repository binary first (always preferred during development/updates)
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     local_bin = os.path.join(repo_root, "qareen")
     if os.path.isfile(local_bin) and os.access(local_bin, os.X_OK):
         return local_bin
+    
+    # Fall back to PATH
+    on_path = shutil.which("qareen")
+    if on_path:
+        return on_path
     return None
 
 
@@ -86,6 +85,7 @@ def main() -> int:
             text=True,
             timeout=QUERY_TIMEOUT_SECS,
             env=env,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         print("Qareen took too long to respond (timed out). Try again, or check `qareen status`.")
@@ -109,6 +109,14 @@ def main() -> int:
         answer = after_marker.lstrip(".\n \t").strip()
     else:
         answer = output.strip()
+
+    # Strip off the ASCII boxed header if present to avoid cramping the Rofi UI
+    box_header = "┌──────────────────────────────────────────────────────────┐"
+    box_idx = answer.find(box_header)
+    if box_idx != -1:
+        lines = answer[box_idx:].split('\n')
+        if len(lines) >= 3:
+            answer = "\n".join(lines[3:]).strip()
 
     if not answer:
         answer = "No answer was generated. Is `qareen start` running, and does your history have anything relevant yet?"
