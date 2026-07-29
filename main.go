@@ -1000,7 +1000,7 @@ func queryGroqLLM(query, timeline, wikiContext string) error {
 			}
 		}
 	}
-	fmt.Println("\n")
+	fmt.Print("\n\n")
 	return nil
 }
 
