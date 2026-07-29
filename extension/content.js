@@ -31,17 +31,25 @@ function sendWebLog(site, target, content, sender = "You") {
     if (!content) return;
     if (isDuplicate(content)) return;
     
-    console.log(`Qareen Content Script sending message: [${site}] -> ${content.substring(0, 50)}...`);
+    console.log(`Qareen Content Script sending log to server: [${site}] -> ${content.substring(0, 50)}...`);
     try {
-        chrome.runtime.sendMessage({
-            action: "logWeb",
-            site: site,
-            target: target,
-            content: content,
-            sender: sender
+        fetch("http://127.0.0.1:2846/log-web", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                site: site,
+                target: target,
+                content: content,
+                sender: sender
+            })
+        })
+        .catch(err => {
+            console.error("Qareen local server logging failed:", err);
         });
     } catch (err) {
-        console.error("Qareen runtime send error:", err);
+        console.error("Qareen fetch error:", err);
     }
 }
 

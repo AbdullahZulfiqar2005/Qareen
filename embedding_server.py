@@ -32,16 +32,6 @@ def cleanup_pid():
     except OSError:
         pass
 
-import lz4.block
-import torch
-from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
-
-# Force CPU execution parameters
-torch.set_num_threads(1)
-if hasattr(torch, "set_grad_enabled"):
-    torch.set_grad_enabled(False)
-
 # GROQ_API_KEY is only needed by chat.py / hyprland_monitor.py / main.go, not
 # by this server (it never calls Groq itself). We intentionally do NOT set a
 # fallback key here - a hardcoded key baked into source and shipped in a repo
@@ -49,18 +39,84 @@ if hasattr(torch, "set_grad_enabled"):
 # anywhere in this project's history, treat it as compromised: revoke it at
 # https://console.groq.com/keys and issue a fresh one, then export it as an
 # environment variable (e.g. in ~/.zshrc): export GROQ_API_KEY="..."
+import ctypes
 
-print("Loading sentence-transformer embedding model...")
-model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-gc.collect()
-print("Model loaded successfully. Starting embedding server on 127.0.0.1:2846...")
+import lz4.block
+
+# Model On-Demand Loading & Unloading Controls
+model = None
+torch = None
+FAISS = None
+HuggingFaceEmbeddings = None
+_model_lock = threading.Lock()
+_unload_timer = None
+
+def load_model():
+    global model, _unload_timer
+    with _model_lock:
+        if _unload_timer is not None:
+            _unload_timer.cancel()
+            _unload_timer = None
+        if model is None:
+            print("[Memory Optimizer] Loading sentence-transformer embedding model on-demand...")
+            import torch as _torch
+            from langchain_community.vectorstores import FAISS as _FAISS
+            from langchain_huggingface import (
+                HuggingFaceEmbeddings as _HuggingFaceEmbeddings,
+            )
+            
+            # Force CPU execution parameters
+            _torch.set_num_threads(1)
+            if hasattr(_torch, "set_grad_enabled"):
+                _torch.set_grad_enabled(False)
+            
+            # Make them globally available
+            globals()['torch'] = _torch
+            globals()['FAISS'] = _FAISS
+            globals()['HuggingFaceEmbeddings'] = _HuggingFaceEmbeddings
+            
+            model = _HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+
+def unload_model():
+    global model, _wiki_store, _event_store
+    with _model_lock:
+        if model is not None:
+            print("[Memory Optimizer] Unloading embedding model and indices to reclaim RAM...")
+            _wiki_store = None
+            _event_store = None
+            model = None
+            
+            # Clear globals
+            for name in ['torch', 'FAISS', 'HuggingFaceEmbeddings']:
+                if name in globals():
+                    del globals()[name]
+            
+            # Remove cached modules from sys.modules to release PyTorch DLLs
+            import sys
+            for mod in list(sys.modules.keys()):
+                if any(x in mod for x in ['torch', 'langchain', 'transformers', 'sentence_transformers', 'faiss']):
+                    del sys.modules[mod]
+            
+            gc.collect()
+            try:
+                libc = ctypes.CDLL("libc.so.6")
+                libc.malloc_trim(0)
+            except Exception as e:  # noqa: BLE001
+                print(f"Warning: malloc_trim failed: {e}")
+            print("[Memory Optimizer] Model and indices successfully unloaded.")
+
+def schedule_model_unload():
+    global _unload_timer
+    with _model_lock:
+        if _unload_timer is not None:
+            _unload_timer.cancel()
+        _unload_timer = threading.Timer(15.0, unload_model)
+        _unload_timer.start()
+
+print("Embedding server starting on 127.0.0.1:2846...")
 
 DB_PATH = os.path.expanduser("~/.qareen.db")
-# One shared connection reused across requests instead of opening a brand new
-# sqlite3 connection on every single /log-web call (connection setup has real
-# overhead, and unnecessary file opens/closes add up under frequent browser
-# activity). check_same_thread=False + an explicit lock makes this safe to
-# share across the handler threads spawned by ThreadingHTTPServer.
+# One shared connection reused across requests
 _db_lock = threading.Lock()
 _db_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 _db_conn.execute("""CREATE TABLE IF NOT EXISTS events (
@@ -73,17 +129,22 @@ _db_conn.execute("""CREATE TABLE IF NOT EXISTS events (
 )""")
 _db_conn.commit()
 
-# Load local Arch Wiki FAISS index (resolve absolute path relative to the script location)
+# Local Arch Wiki FAISS index path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WIKI_INDEX_PATH = os.path.join(SCRIPT_DIR, "arch_wiki_index")
 _wiki_store = None
-if os.path.exists(WIKI_INDEX_PATH):
-    print("Loading local Arch Wiki FAISS index...")
-    try:
-        _wiki_store = FAISS.load_local(WIKI_INDEX_PATH, model, allow_dangerous_deserialization=True)
-        print("Arch Wiki FAISS index loaded successfully.")
-    except Exception as e:  # noqa: BLE001
-        print(f"Warning: Failed to load Arch Wiki FAISS index: {e!s}")
+
+def get_wiki_store():
+    global _wiki_store
+    if _wiki_store is None and os.path.exists(WIKI_INDEX_PATH):
+        print("Loading local Arch Wiki FAISS index on-demand...")
+        try:
+            load_model()
+            _wiki_store = FAISS.load_local(WIKI_INDEX_PATH, model, allow_dangerous_deserialization=True)
+            print("Arch Wiki FAISS index loaded successfully.")
+        except Exception as e:  # noqa: BLE001
+            print(f"Warning: Failed to load Arch Wiki FAISS index: {e!s}")
+    return _wiki_store
 
 # --- Event FAISS Index ---
 EVENT_INDEX_PATH = os.path.expanduser("~/.qareen_event_index")
@@ -92,6 +153,12 @@ _event_store = None
 _last_indexed_id = 0
 _event_index_dirty = False
 _event_insert_count = 0
+
+def get_event_store():
+    if _event_store is None:
+        load_model()
+        _load_or_build_event_index()
+    return _event_store
 
 
 def _unpack_blob(blob):
@@ -216,7 +283,9 @@ def _sync_new_events():
     if not texts:
         return
 
-    if _event_store is None:
+    global _event_store
+    store = get_event_store()
+    if store is None:
         _event_store = FAISS.from_embeddings(
             list(zip(texts, embeddings)),
             model,
@@ -243,7 +312,9 @@ def _add_event_to_index(event_id, timestamp, event_type, app, content, embedding
         "app": app,
     }
 
-    if _event_store is None:
+    global _event_store
+    store = get_event_store()
+    if store is None:
         _event_store = FAISS.from_embeddings(
             [(content, embedding_vec)],
             model,
@@ -276,7 +347,6 @@ def _background_index_saver():
                     print(f"Warning: Failed to save event index: {e}")
 
 
-_load_or_build_event_index()
 _saver_thread = threading.Thread(target=_background_index_saver, daemon=True)
 _saver_thread.start()
 
@@ -398,7 +468,9 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                     self.wfile.write(b"Error: 'texts' list cannot be empty.")
                     return
                     
+                load_model()
                 embeddings = model.embed_documents(texts)
+                schedule_model_unload()
                 
                 self.send_response(200)
                 self.send_header('Access-Control-Allow-Origin', '*')
@@ -421,13 +493,15 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                 k = data.get('k', 3)
                 
                 results = []
-                if _wiki_store and query:
-                    docs = _wiki_store.similarity_search(query, k=k)
+                wiki_store = get_wiki_store()
+                if wiki_store and query:
+                    docs = wiki_store.similarity_search(query, k=k)
                     for doc in docs:
                         results.append({
                             'content': doc.page_content,
                             'source': doc.metadata.get('source', 'Unknown')
                         })
+                schedule_model_unload()
                 
                 self.send_response(200)
                 self.send_header('Access-Control-Allow-Origin', '*')
@@ -478,19 +552,22 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                             'content': r_content,
                             'score': 1.0,
                         })
-                elif _event_store is not None:
-                    with _event_index_lock:
-                        docs_and_scores = _event_store.similarity_search_with_score(query, k=k)
-                    for doc, score in docs_and_scores:
-                        similarity = 1.0 - float(score)
-                        results.append({
-                            'event_id': doc.metadata.get('event_id', 0),
-                            'timestamp': doc.metadata.get('timestamp', ''),
-                            'event_type': doc.metadata.get('event_type', ''),
-                            'app': doc.metadata.get('app', ''),
-                            'content': doc.page_content,
-                            'score': similarity,
-                        })
+                else:
+                    event_store = get_event_store()
+                    if event_store is not None:
+                        with _event_index_lock:
+                            docs_and_scores = event_store.similarity_search_with_score(query, k=k)
+                        for doc, score in docs_and_scores:
+                            similarity = 1.0 - float(score)
+                            results.append({
+                                'event_id': doc.metadata.get('event_id', 0),
+                                'timestamp': doc.metadata.get('timestamp', ''),
+                                'event_type': doc.metadata.get('event_type', ''),
+                                'app': doc.metadata.get('app', ''),
+                                'content': doc.page_content,
+                                'score': similarity,
+                            })
+                schedule_model_unload()
 
                 self.send_response(200)
                 self.send_header('Access-Control-Allow-Origin', '*')
@@ -526,6 +603,7 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                 
                 # Generate embedding based on the descriptive event
                 formatted_text = f"[{timestamp}] [{site.upper()}] [{target}] {db_content}"
+                load_model()
                 embedding = model.embed_query(formatted_text)
                 embedding_blob = pack_embedding(embedding)
 
@@ -547,6 +625,7 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                     )
                 
                 print(f"[Web Log] Successfully saved {site} event: {content[:50]}...")
+                schedule_model_unload()
                 
                 self.send_response(200)
                 self.send_header('Access-Control-Allow-Origin', '*')

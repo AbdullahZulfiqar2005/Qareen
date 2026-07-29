@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"runtime/debug"
 	"time"
 	"unsafe"
 
@@ -127,6 +128,7 @@ func loadDotEnv() {
 }
 
 func main() {
+	debug.SetGCPercent(20)
 	loadDotEnv()
 
 	if len(os.Args) < 2 {
@@ -635,6 +637,7 @@ func runDaemonLoop() {
 				}
 				lastTabs = currentTabStrings
 			}
+			debug.FreeOSMemory()
 
 		case <-tickerSysLog.C:
 			// 5. System Error Logs tracking.
@@ -792,7 +795,7 @@ func queryDaemon(queryText string) {
 	// Semantic search via FAISS index on the embedding server
 	searchPayload, _ := json.Marshal(map[string]interface{}{
 		"query": queryText,
-		"k":     12,
+		"k":     40,
 	})
 	searchResp, err := http.Post(ServerURL+"/search", "application/json", bytes.NewBuffer(searchPayload))
 	if err != nil {
@@ -839,6 +842,48 @@ func queryDaemon(queryText string) {
 		fmt.Println("No recorded interactions or events found. Try running some shell commands or browsing to build history!")
 		return
 	}
+
+	// Adjust scores and filter matches to prioritize real activities over self-queries/notifications
+	queryLower := strings.ToLower(queryText)
+	hasQueryKeyword := strings.Contains(queryLower, "query") || strings.Contains(queryLower, "queries") || strings.Contains(queryLower, "ask")
+	hasNotificationKeyword := strings.Contains(queryLower, "notification") || strings.Contains(queryLower, "notifications") || strings.Contains(queryLower, "alert") || strings.Contains(queryLower, "permission")
+
+	var filteredMatches []SimilarityMatch
+	for i := range matches {
+		m := matches[i]
+		mType := strings.ToLower(m.Event.Type)
+		mApp := strings.ToLower(m.Event.App)
+		mContent := strings.ToLower(m.Event.Content)
+
+		// 1. Skip self-queries and system notifications unless explicitly requested
+		if mType == "query" && !hasQueryKeyword {
+			continue
+		}
+		if mType == "notification" && !hasNotificationKeyword {
+			continue
+		}
+
+		score := m.Score
+
+		// 2. Boost exact keyword matches in app name or event type
+		for _, word := range strings.Fields(queryLower) {
+			if len(word) < 3 {
+				continue
+			}
+			// Boost if the target keyword is the app or event type
+			if strings.Contains(mApp, word) || strings.Contains(mType, word) {
+				score += 0.40
+			}
+			// Boost if the content contains the word
+			if strings.Contains(mContent, word) {
+				score += 0.15
+			}
+		}
+
+		m.Score = score
+		filteredMatches = append(filteredMatches, m)
+	}
+	matches = filteredMatches
 
 	// Sort matches by cosine score descending
 	sort.Slice(matches, func(i, j int) bool {

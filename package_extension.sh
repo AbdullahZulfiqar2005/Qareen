@@ -8,7 +8,7 @@ if [ -f qareen.xpi ]; then
 fi
 
 cd extension
-zip -r ../qareen.xpi manifest.json content.js background.js
+zip -r ../qareen.xpi manifest.json content.js
 cd ..
 
 echo "--------------------------------------------------------"

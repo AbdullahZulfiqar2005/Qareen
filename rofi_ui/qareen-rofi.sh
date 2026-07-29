@@ -42,7 +42,7 @@ textbox { text-color: #bb9af7; font: "JetBrainsMono Nerd Font Bold 12"; }
 
 # Answer phase: wider window with more breathing room for reading
 ANSWER_STYLE='
-window { width: 800px; }
+window { width: 800px; height: 650px; }
 mainbox { padding: 24px; spacing: 16px; }
 message { padding: 20px 24px; }
 textbox { font: "JetBrainsMono Nerd Font 11"; }
@@ -50,7 +50,7 @@ textbox { font: "JetBrainsMono Nerd Font 11"; }
 
 # Error phase: urgent red border + red message text
 ERROR_STYLE='
-window { border-color: #f7768e; width: 720px; }
+window { border-color: #f7768e; width: 720px; height: 650px; }
 mainbox { padding: 20px; }
 message { border-color: #f7768e4d; }
 textbox { text-color: #f7768e; }
