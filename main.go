@@ -3,27 +3,25 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"database/sql"
 	"embed"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"io/fs"
 	"math"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
-	"runtime/debug"
+
 	"time"
 	"unsafe"
 
@@ -34,11 +32,11 @@ import (
 
 // Global Configuration
 const (
-	ServerPort     = "2846"
-	ServerURL      = "http://127.0.0.1:" + ServerPort
-	DashboardPort  = "2847"
-	GroqModel      = "llama-3.3-70b-versatile"
-	EmbedDim       = 384 // output dimension of the all-MiniLM-L6-v2 sentence embedding model
+	ServerPort    = "2846"
+	ServerURL     = "http://127.0.0.1:" + ServerPort
+	DashboardPort = "2847"
+	GroqModel     = "llama-3.3-70b-versatile"
+	EmbedDim      = 384 // output dimension of the all-MiniLM-L6-v2 sentence embedding model
 )
 
 //go:embed dashboard/*
@@ -128,7 +126,7 @@ func loadDotEnv() {
 }
 
 func main() {
-	debug.SetGCPercent(20)
+	syscall.Umask(0077)
 	loadDotEnv()
 
 	if len(os.Args) < 2 {
@@ -138,6 +136,35 @@ func main() {
 
 	command := os.Args[1]
 	switch command {
+	case "token":
+		role := "admin"
+		if len(os.Args) > 2 {
+			role = os.Args[2]
+		}
+		if role != "admin" && role != "ingest" {
+			fmt.Fprintln(os.Stderr, "role must be admin or ingest")
+			os.Exit(1)
+		}
+		content, err := os.ReadFile(filepath.Join(qareenDataDir(), role+".token"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Start the service first")
+			os.Exit(1)
+		}
+		fmt.Println(strings.TrimSpace(string(content)))
+	case "doctor":
+		runDoctor()
+	case "pause", "resume":
+		if err := callAPI("POST", "/api/settings", map[string]interface{}{"paused": command == "pause"}, nil); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	case "export":
+		var result interface{}
+		if err := callAPI("GET", "/api/export", nil, &result); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		json.NewEncoder(os.Stdout).Encode(result)
 	case "start":
 		startDaemon()
 	case "stop":
@@ -145,7 +172,7 @@ func main() {
 	case "status":
 		statusDaemon()
 	case "run-daemon":
-		runDaemonLoop()
+		os.Exit(runDaemonLoop())
 	case "query":
 		if len(os.Args) < 3 {
 			fmt.Println("Error: Query text required. Usage: qareen query \"<issue>\"")
@@ -185,211 +212,60 @@ func printUsage() {
 
 func getPaths() (string, string, string, string) {
 	home, _ := os.UserHomeDir()
-	dbPath := filepath.Join(home, ".qareen.db")
-	daemonPidPath := "/tmp/qareend.pid"
-	pyPidPath := "/tmp/qareen_py.pid"
-	logPath := filepath.Join(home, ".qareen.log")
-	return dbPath, daemonPidPath, pyPidPath, logPath
+	dbPath := os.Getenv("QAREEN_DB_PATH")
+	if dbPath == "" {
+		dbPath = filepath.Join(home, ".qareen.db")
+	}
+	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
+	if runtimeDir == "" {
+		runtimeDir = qareenDataDir()
+	}
+	return dbPath, filepath.Join(runtimeDir, "qareend.pid"), filepath.Join(runtimeDir, "qareen_py.pid"), filepath.Join(qareenDataDir(), "collector.log")
 }
 
 func startDaemon() {
-	_, daemonPidPath, pyPidPath, logPath := getPaths()
-
-	// Check if already running
-	if isPidRunning(daemonPidPath) {
-		fmt.Println("Qareen background service is already running.")
-		return
-	}
-
-	fmt.Println("Starting Qareen system tracking service...")
-
-	// 1. Start Python embedding server if port is not active.
-	//
-	// IMPORTANT: a failure here must NOT stop step 2 below. Previously this
-	// function returned early on any embedding-server failure (missing venv,
-	// python crash, etc.), which silently prevented ALL perception - shell
-	// commands, active window, browser tabs, system logs, everything - from
-	// being tracked, not just AI-query/embedding support. logEvent() already
-	// degrades gracefully (saves events with a NULL embedding) when the
-	// embedding server is unreachable, so the tracking daemon should always
-	// start; we just warn clearly that embeddings/qareen query won't work
-	// until the embedding server issue is fixed.
-	embeddingServerOK := isPortOpen(ServerPort)
-	if !embeddingServerOK {
-		fmt.Println("Launching local embedding & tab server...")
-		pyBin := filepath.Join(os.Getenv("HOME"), "venv/bin/python")
-
-		pyScript := "embedding_server.py"
-		if _, err := os.Stat(pyScript); os.IsNotExist(err) {
-			workspaceScript := filepath.Join(os.Getenv("HOME"), "Qareen", "embedding_server.py")
-			if _, err := os.Stat(workspaceScript); err == nil {
-				pyScript = workspaceScript
-			}
-		}
-
-		pyCmd := exec.Command(pyBin, pyScript)
-		pyCmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-
-		// Redirect output to log file
-		lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err == nil {
-			pyCmd.Stdout = lf
-			pyCmd.Stderr = lf
-		}
-
-		err = pyCmd.Start()
-		if err != nil {
-			fmt.Printf("%sWarning: failed to start python embedding server: %v%s\n", Yellow, err, Reset)
-			fmt.Println("Tracking will continue, but embeddings, 'qareen query', and browser-extension logging will not work until this is fixed.")
-			fmt.Printf("Check that %s exists (see README setup step 1), or that %s is available on PATH.\n", pyBin, pyScript)
-		} else {
-			// Write Python PID
-			os.WriteFile(pyPidPath, []byte(strconv.Itoa(pyCmd.Process.Pid)), 0644)
-
-			// Wait for port to open (up to 10 seconds)
-			for i := 0; i < 20; i++ {
-				if isPortOpen(ServerPort) {
-					embeddingServerOK = true
-					break
-				}
-				time.Sleep(500 * time.Millisecond)
-			}
-			if !embeddingServerOK {
-				fmt.Printf("%sWarning: embedding server did not come up within 10s. Tracking will continue without it.%s\n", Yellow, Reset)
-			}
-		}
-	}
-
-	// 2. Start Go Daemon process (always - independent of step 1's outcome)
-	cmd := exec.Command(os.Args[0], "run-daemon")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err == nil {
-		cmd.Stdout = lf
-		cmd.Stderr = lf
-	}
-	err = cmd.Start()
-	if err != nil {
-		fmt.Printf("Error launching Qareen background daemon: %v\n", err)
-		return
-	}
-
-	os.WriteFile(daemonPidPath, []byte(strconv.Itoa(cmd.Process.Pid)), 0644)
-	fmt.Printf("%sQareen background service successfully started!%s\n", Green, Reset)
-	fmt.Printf("Logs are stored at: %s\n", logPath)
+	serviceControl("start")
 }
 
 func stopDaemon() {
-	_, daemonPidPath, pyPidPath, _ := getPaths()
-
-	stoppedAny := false
-	var daemonPid, pyPid int
-
-	// Kill Go Daemon
-	if isPidRunning(daemonPidPath) {
-		pidData, _ := os.ReadFile(daemonPidPath)
-		daemonPid, _ = strconv.Atoi(string(bytes.TrimSpace(pidData)))
-		fmt.Printf("Stopping Qareen daemon (PID %d)...\n", daemonPid)
-		syscall.Kill(daemonPid, syscall.SIGTERM)
-		stoppedAny = true
-	}
-
-	// Kill Python Server
-	if isPidRunning(pyPidPath) {
-		pidData, _ := os.ReadFile(pyPidPath)
-		pyPid, _ = strconv.Atoi(string(bytes.TrimSpace(pidData)))
-		fmt.Printf("Stopping embedding server (PID %d)...\n", pyPid)
-		syscall.Kill(pyPid, syscall.SIGTERM)
-		stoppedAny = true
-	}
-
-	if stoppedAny {
-		// Wait for processes to actually stop and free resources/ports
-		fmt.Print("Waiting for services to release resources...")
-		for i := 0; i < 30; i++ {
-			daemonRunning := false
-			if daemonPid > 0 {
-				if proc, err := os.FindProcess(daemonPid); err == nil {
-					if err := proc.Signal(syscall.Signal(0)); err == nil {
-						daemonRunning = true
-					}
-				}
-			}
-			pyRunning := false
-			if pyPid > 0 {
-				if proc, err := os.FindProcess(pyPid); err == nil {
-					if err := proc.Signal(syscall.Signal(0)); err == nil {
-						pyRunning = true
-					}
-				}
-			}
-			if !daemonRunning && !pyRunning && !isPortOpen(ServerPort) {
-				break
-			}
-			fmt.Print(".")
-			time.Sleep(200 * time.Millisecond)
-		}
-		fmt.Println()
-
-		// Clean up pid files at the end
-		os.Remove(daemonPidPath)
-		os.Remove(pyPidPath)
-
-		fmt.Printf("%sQareen background services stopped.%s\n", Yellow, Reset)
-	} else {
-		fmt.Println("No active Qareen services found running.")
-	}
+	serviceControl("stop")
 }
 
 func statusDaemon() {
-	dbPath, daemonPidPath, pyPidPath, _ := getPaths()
-
-	daemonRunning := isPidRunning(daemonPidPath)
-	pyRunning := isPidRunning(pyPidPath)
-
-	fmt.Printf("%s%sQareen Status Report:%s\n", Blue, Bold, Reset)
-	if daemonRunning {
-		pid, _ := os.ReadFile(daemonPidPath)
-		fmt.Printf("  - Tracking Daemon:  %sActive%s (PID %s)\n", Green, Reset, string(bytes.TrimSpace(pid)))
-	} else {
-		fmt.Printf("  - Tracking Daemon:  %sInactive%s\n", Red, Reset)
-	}
-
-	if pyRunning {
-		pid, _ := os.ReadFile(pyPidPath)
-		fmt.Printf("  - Embedding Server: %sActive%s (PID %s)\n", Green, Reset, string(bytes.TrimSpace(pid)))
-	} else {
-		fmt.Printf("  - Embedding Server: %sInactive%s\n", Red, Reset)
-	}
-
-	// Database info
-	db, err := sql.Open("sqlite", dbPath)
-	if err == nil {
-		defer db.Close()
-		var count int
-		err = db.QueryRow("SELECT COUNT(*) FROM events").Scan(&count)
-		if err == nil {
-			fmt.Printf("  - SQLite Database:  Connected (%d events logged)\n", count)
-		} else {
-			fmt.Println("  - SQLite Database:  Connected (empty or uninitialized)")
-		}
-	} else {
-		fmt.Printf("  - SQLite Database:  %sDisconnected (%v)%s\n", Red, err, Reset)
-	}
+	serviceControl("status")
 }
 
 // ---------------- DAEMON RUN LOOP ----------------
 
-func runDaemonLoop() {
+func runDaemonLoop() int {
 	dbPath, daemonPidPath, _, _ := getPaths()
-	os.WriteFile(daemonPidPath, []byte(strconv.Itoa(os.Getpid())), 0644)
-	defer os.Remove(daemonPidPath)
+	lock, err := os.OpenFile(daemonPidPath+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		logError("Collector lock unavailable")
+		return 1
+	}
+	defer lock.Close()
+	if syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+		logError("Collector already running")
+		return 1
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 
+	// Share the migration lock with the Python store during concurrent startup.
+	schemaLock, err := os.OpenFile(dbPath+".migration.lock", os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0600)
+	if err != nil {
+		logError("Schema lock unavailable")
+		return 1
+	}
+	defer schemaLock.Close()
+	if err = syscall.Flock(int(schemaLock.Fd()), syscall.LOCK_EX); err != nil {
+		return 1
+	}
 	// Setup database
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)")
 	if err != nil {
 		logError("Failed to open SQLite database: %v", err)
-		return
+		return 1
 	}
 	defer db.Close()
 
@@ -403,7 +279,7 @@ func runDaemonLoop() {
 	)`)
 	if err != nil {
 		logError("Failed to initialize database tables: %v", err)
-		return
+		return 1
 	}
 	// Helpful for `qareen list` / status and any future timestamp-ordered
 	// queries; without it every ORDER BY/LIMIT still does a full table scan.
@@ -412,10 +288,20 @@ func runDaemonLoop() {
 		logError("Failed to create timestamp index: %v", err)
 	}
 
-	logInfo("Daemon loop started.")
+	if err := ensureEventSchema(db); err != nil {
+		logError("Schema initialization failed: %v", err)
+		return 1
+	}
+	syscall.Flock(int(schemaLock.Fd()), syscall.LOCK_UN)
+	os.Chmod(dbPath, 0600)
+	logInfo("Daemon loop started (event bodies are not logged).")
+	go drainOutbox()
+	go collectJournal(db)
 
 	// Start native Hyprland keybind tracker
-	go startKeybindTracker(db)
+	if os.Getenv("QAREEN_CAPTURE_KEYBINDS") == "1" {
+		go startKeybindTracker(db)
+	}
 
 	// Start desktop notification watcher (dunst/mako/swaync/etc via DBus)
 	go startNotificationWatcher(db)
@@ -451,173 +337,57 @@ func runDaemonLoop() {
 	}
 
 	// Firefox History state
-	lastPlacesTimestamp := time.Now().UnixNano() / 1000 // UTC microseconds
+	lastPlacesTimestamp := time.Now().UnixMicro()
+	firefoxCursorPath := filepath.Join(qareenDataDir(), "firefox.cursor")
+	if raw, err := os.ReadFile(firefoxCursorPath); err == nil {
+		if v, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64); err == nil {
+			lastPlacesTimestamp = v
+		}
+	}
 
 	// Firefox Tabs state
 	var lastTabs []string
 
 	// System log tracking state
-	lastSysLogCheck := time.Now()
 
 	// Loop tickers
-	tickerFast := time.NewTicker(2 * time.Second)    // Active Window
-	tickerMedium := time.NewTicker(5 * time.Second)  // Shell Command / Firefox history
-	tickerSlow := time.NewTicker(30 * time.Second)   // Open Tabs
-	tickerSysLog := time.NewTicker(15 * time.Second) // Journalctl errors
+	tickerFast := time.NewTicker(2 * time.Second)   // Active Window
+	tickerMedium := time.NewTicker(5 * time.Second) // Shell Command / Firefox history
+	tickerSlow := time.NewTicker(30 * time.Second)  // Open Tabs
 
 	defer tickerFast.Stop()
 	defer tickerMedium.Stop()
 	defer tickerSlow.Stop()
-	defer tickerSysLog.Stop()
 
 	for {
 		select {
 		case <-done:
 			logInfo("Daemon loop exited.")
-			return
+			return 0
 		case <-tickerFast.C:
-			// 1. Active window tracking
 			c, t, err := getActiveWindow()
-			if err == nil && (c != lastClass || t != lastTitle) {
-				if c != "" || t != "" {
-					appType := c
-					logContent := t
-					lowerClass := strings.ToLower(c)
-					isBrowser := strings.Contains(lowerClass, "firefox") ||
-						strings.Contains(lowerClass, "chrome") ||
-						strings.Contains(lowerClass, "brave") ||
-						strings.Contains(lowerClass, "chromium")
-
-					if isBrowser {
-						if strings.Contains(t, "WhatsApp") {
-							appType = "whatsapp"
-							if strings.Contains(t, " - ") {
-								parts := strings.SplitN(t, " - ", 2)
-								logContent = "Chatting with " + parts[1] + " on WhatsApp"
-							} else {
-								logContent = "Opened WhatsApp Web"
-							}
-						} else if strings.Contains(t, "ChatGPT") {
-							appType = "chatgpt"
-							if strings.Contains(t, " - ") {
-								parts := strings.SplitN(t, " - ", 2)
-								logContent = "Prompted/Viewed ChatGPT: " + parts[1]
-							} else {
-								logContent = "Opened ChatGPT"
-							}
-						} else if strings.Contains(t, "Claude") {
-							appType = "claude"
-							if strings.Contains(t, " - ") {
-								parts := strings.SplitN(t, " - ", 2)
-								logContent = "Prompted/Viewed Claude: " + parts[1]
-							} else {
-								logContent = "Opened Claude"
-							}
-						} else if strings.Contains(t, "Gemini") {
-							appType = "gemini"
-							if strings.Contains(t, " - ") {
-								parts := strings.SplitN(t, " - ", 2)
-								logContent = "Prompted/Viewed Gemini: " + parts[1]
-							} else {
-								logContent = "Opened Gemini"
-							}
-						} else if strings.Contains(t, "Grok") {
-							appType = "grok"
-							if strings.Contains(t, " - ") {
-								parts := strings.SplitN(t, " - ", 2)
-								logContent = "Prompted/Viewed Grok: " + parts[1]
-							} else {
-								logContent = "Opened Grok"
-							}
-						} else if strings.Contains(t, "Google Search") {
-							appType = "google"
-							if strings.Contains(t, " - ") {
-								parts := strings.SplitN(t, " - ", 2)
-								logContent = "Searched Google for: " + parts[0]
-							}
-						} else {
-							logContent = fmt.Sprintf("Browsed: %s", t)
-						}
-					} else {
-						logContent = fmt.Sprintf("Active window changed to: %s (app: %s)", t, c)
-					}
-
-					logEvent(db, "window", appType, logContent)
+			if err == nil && (c != lastClass || t != lastTitle) && (c != "" || t != "") {
+				if logEvent(db, "window", c, "Observed active window title: "+t) {
+					lastClass = c
+					lastTitle = t
 				}
-				lastClass = c
-				lastTitle = t
 			}
 
 		case <-tickerMedium.C:
-			// 2. Shell Command tracking (Zsh)
-			if fi, err := os.Stat(zshPath); err == nil && fi.Size() > lastZshSize {
-				f, err := os.Open(zshPath)
-				if err == nil {
-					f.Seek(lastZshSize, 0)
-					scanner := bufio.NewScanner(f)
-					for scanner.Scan() {
-						line := scanner.Text()
-						if strings.HasPrefix(line, ": ") {
-							parts := strings.SplitN(line, ";", 2)
-							if len(parts) == 2 {
-								cmdStr := strings.TrimSpace(parts[1])
-								if cmdStr != "" {
-									logEvent(db, "command", "zsh", fmt.Sprintf("Executed shell command: %s", cmdStr))
-								}
-							}
-						}
-					}
-					f.Close()
-				}
-				lastZshSize = fi.Size()
-			}
-
-			// Shell Command tracking (Bash)
-			if fi, err := os.Stat(bashPath); err == nil && fi.Size() > lastBashSize {
-				f, err := os.Open(bashPath)
-				if err == nil {
-					f.Seek(lastBashSize, 0)
-					scanner := bufio.NewScanner(f)
-					for scanner.Scan() {
-						cmdStr := strings.TrimSpace(scanner.Text())
-						if cmdStr != "" {
-							logEvent(db, "command", "bash", fmt.Sprintf("Executed shell command: %s", cmdStr))
-						}
-					}
-					f.Close()
-				}
-				lastBashSize = fi.Size()
-			}
-
-			// 3. Firefox history tracking.
-			// Previously this copied the *entire* places.sqlite file (which can be
-			// tens of megabytes) to /tmp every 5 seconds forever, burning disk I/O,
-			// CPU, and SSD write cycles for no reason. Firefox's places.sqlite uses
-			// WAL journal mode, so it can be opened directly as a second read-only
-			// connection with no copy needed. We only fall back to the old
-			// copy-then-read approach if the direct read-only open fails (e.g. the
-			// profile is using a legacy rollback journal).
-			ffProfile, err := findFirefoxProfile()
-			if err == nil {
-				placesPath := filepath.Join(ffProfile, "places.sqlite")
-				latestVisit, ok := scanFirefoxHistory(placesPath, lastPlacesTimestamp, db)
-				if !ok {
-					// Fallback: copy then read (slow path, rarely needed).
-					tempPlaces := "/tmp/qareen_places.sqlite"
-					if err := copyFile(placesPath, tempPlaces); err == nil {
-						latestVisit, _ = scanFirefoxHistory(tempPlaces, lastPlacesTimestamp, db)
-						os.Remove(tempPlaces)
-					}
-				}
-				if latestVisit > lastPlacesTimestamp {
-					lastPlacesTimestamp = latestVisit
+			lastZshSize = scanShellHistory(db, zshPath, lastZshSize, true)
+			lastBashSize = scanShellHistory(db, bashPath, lastBashSize, false)
+			if profile, err := findFirefoxProfile(); err == nil {
+				latest, ok := scanFirefoxHistory(filepath.Join(profile, "places.sqlite"), lastPlacesTimestamp, db)
+				if ok && latest > lastPlacesTimestamp {
+					lastPlacesTimestamp = latest
+					atomicPrivateFile(firefoxCursorPath, []byte(strconv.FormatInt(latest, 10)))
 				}
 			}
 
 		case <-tickerSlow.C:
 			// 4. Firefox Tabs tracking
 			tabs, err := getFirefoxTabs()
-			if err == nil && len(tabs) > 0 {
+			if err == nil {
 				var currentTabStrings []string
 				for _, tab := range tabs {
 					currentTabStrings = append(currentTabStrings, fmt.Sprintf("%s (%s)", tab.Title, tab.URL))
@@ -632,47 +402,29 @@ func runDaemonLoop() {
 						}
 					}
 					if isNew {
-						logEvent(db, "tab", "firefox", fmt.Sprintf("Opened browser tab: %s", tabStr))
+						logEvent(db, "tab", "firefox", fmt.Sprintf("Observed browser tab: %s", tabStr))
 					}
 				}
 				lastTabs = currentTabStrings
 			}
-			debug.FreeOSMemory()
 
-		case <-tickerSysLog.C:
-			// 5. System Error Logs tracking.
-			// Previously this always asked journalctl for "the last 15 seconds",
-			// with no relation to when it last actually ran. Timer drift (GC
-			// pauses, system load, laptop suspend) meant errors could be logged
-			// twice or missed entirely. We now track the exact timestamp of the
-			// last successful scan and ask journalctl for everything since then.
-			errs, err := getJournalErrors(lastSysLogCheck)
-			if err == nil {
-				for _, errMsg := range errs {
-					logEvent(db, "error", "system", fmt.Sprintf("System logged critical error: %s", errMsg))
-				}
-			}
-			lastSysLogCheck = time.Now()
 		}
 	}
 }
 
 func getActiveWindow() (string, string, error) {
-	cmd := exec.Command("hyprctl", "activewindow", "-j")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	err := cmd.Run()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "hyprctl", "activewindow", "-j").Output()
 	if err != nil {
 		return "", "", err
 	}
-	var res struct {
+	var window struct {
 		Class string `json:"class"`
 		Title string `json:"title"`
 	}
-	if err := json.Unmarshal(out.Bytes(), &res); err != nil {
-		return "", "", err
-	}
-	return res.Class, res.Title, nil
+	err = json.Unmarshal(out, &window)
+	return window.Class, window.Title, err
 }
 
 func getFirefoxTabs() ([]TabInfo, error) {
@@ -690,59 +442,8 @@ func getFirefoxTabs() ([]TabInfo, error) {
 	return res.Tabs, nil
 }
 
-func getJournalErrors(since time.Time) ([]string, error) {
-	sinceStr := since.Format("2006-01-02 15:04:05")
-	cmd := exec.Command("journalctl", "--since", sinceStr, "-p", "3", "-o", "json")
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
-	var errors []string
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		var entry map[string]interface{}
-		if err := json.Unmarshal([]byte(line), &entry); err == nil {
-			if msg, ok := entry["MESSAGE"].(string); ok {
-				unit := ""
-				if u, ok := entry["_SYSTEMD_UNIT"].(string); ok {
-					unit = u
-				}
-				errors = append(errors, fmt.Sprintf("%s: %s", unit, msg))
-			}
-		}
-	}
-	return errors, nil
-}
-
-func logEvent(db *sql.DB, eventType, app, content string) {
-	timestampStr := time.Now().Format("2006-01-02 15:04:05")
-	formattedText := fmt.Sprintf("[%s] [%s] [%s] %s", timestampStr, strings.ToUpper(eventType), app, content)
-
-	logInfo("Logging Event: %s", formattedText)
-
-	// Fetch embedding. If the embedding server is briefly unreachable we still
-	// keep the event (with a NULL embedding) instead of silently dropping it -
-	// previously a single failed embedding call meant the whole event vanished
-	// with no record it ever happened.
-	embedding, err := getEmbedding(formattedText)
-	var embedBlob []byte
-	if err != nil {
-		logError("Failed to fetch embedding (event will be saved without one): %v", err)
-	} else {
-		embedBlob = encodeEmbedding(embedding)
-	}
-
-	_, err = db.Exec(
-		"INSERT INTO events (timestamp, event_type, app, content, embedding) VALUES (?, ?, ?, ?, ?)",
-		timestampStr, eventType, app, content, embedBlob,
-	)
-	if err != nil {
-		logError("Failed to save event to database: %v", err)
-	}
+func logEvent(db *sql.DB, eventType, app, content string) bool {
+	return persistEvent(db, eventType, app, content, time.Now().UTC(), "")
 }
 
 // encodeEmbedding packs a []float64 embedding into a compact little-endian
@@ -761,182 +462,42 @@ func encodeEmbedding(embedding []float64) []byte {
 // handles the old JSON-text format so existing databases created by earlier
 // versions of Qareen keep working without a manual migration.
 func decodeEmbedding(raw []byte) ([]float64, bool) {
-	if len(raw) > 0 && (raw[0] == '[' || raw[0] == ' ') {
+	// Known binary format wins over legacy sniffing: a float can begin with '['.
+	if len(raw) != EmbedDim*4 {
 		var legacy []float64
-		if err := json.Unmarshal(raw, &legacy); err == nil {
+		if json.Unmarshal(raw, &legacy) == nil && len(legacy) > 0 {
 			return legacy, true
 		}
 		return nil, false
 	}
-	if len(raw) == 0 || len(raw)%4 != 0 {
-		return nil, false
+	result := make([]float64, EmbedDim)
+	for i := range result {
+		result[i] = float64(math.Float32frombits(binary.LittleEndian.Uint32(raw[i*4:])))
 	}
-	out := make([]float64, len(raw)/4)
-	for i := range out {
-		bits := binary.LittleEndian.Uint32(raw[i*4:])
-		out[i] = float64(math.Float32frombits(bits))
-	}
-	return out, true
+	return result, true
 }
 
 // ---------------- QUERY SEARCH & LLM ----------------
 
 func queryDaemon(queryText string) {
-	dbPath, _, _, _ := getPaths()
-
-	// Open DB (needed for logging the query as an event at the end)
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		fmt.Printf("Error opening SQLite: %v\n", err)
-		return
-	}
-	defer db.Close()
-
-	// Semantic search via FAISS index on the embedding server
-	searchPayload, _ := json.Marshal(map[string]interface{}{
-		"query": queryText,
-		"k":     40,
-	})
-	searchResp, err := http.Post(ServerURL+"/search", "application/json", bytes.NewBuffer(searchPayload))
-	if err != nil {
-		fmt.Printf("Error calling search endpoint: %v\n", err)
-		return
-	}
-	defer searchResp.Body.Close()
-	searchBody, err := io.ReadAll(searchResp.Body)
-	if err != nil {
-		fmt.Printf("Error reading search response: %v\n", err)
-		return
-	}
-
-	var searchResult struct {
+	var answer struct {
+		Answer  string `json:"answer"`
 		Results []struct {
-			EventID   int     `json:"event_id"`
-			Timestamp string  `json:"timestamp"`
-			EventType string  `json:"event_type"`
-			App       string  `json:"app"`
-			Content   string  `json:"content"`
-			Score     float64 `json:"score"`
+			ID        int    `json:"id"`
+			Content   string `json:"content"`
+			Timestamp string `json:"timestamp"`
 		} `json:"results"`
+		Coverage interface{} `json:"coverage"`
 	}
-	if err := json.Unmarshal(searchBody, &searchResult); err != nil {
-		fmt.Printf("Error parsing search response: %v\n", err)
-		return
+	if err := callAPI("POST", "/api/ask", map[string]interface{}{"query": queryText}, &answer); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
-
-	var matches []SimilarityMatch
-	for _, r := range searchResult.Results {
-		matches = append(matches, SimilarityMatch{
-			Event: Event{
-				ID:        r.EventID,
-				Timestamp: r.Timestamp,
-				Type:      r.EventType,
-				App:       r.App,
-				Content:   r.Content,
-			},
-			Score: r.Score,
-		})
+	fmt.Println(answer.Answer)
+	for _, event := range answer.Results {
+		fmt.Printf("[event:%d] %s %s\n", event.ID, event.Timestamp, event.Content)
 	}
-
-	if len(matches) == 0 {
-		fmt.Println("No recorded interactions or events found. Try running some shell commands or browsing to build history!")
-		return
-	}
-
-	// Adjust scores and filter matches to prioritize real activities over self-queries/notifications
-	queryLower := strings.ToLower(queryText)
-	hasQueryKeyword := strings.Contains(queryLower, "query") || strings.Contains(queryLower, "queries") || strings.Contains(queryLower, "ask")
-	hasNotificationKeyword := strings.Contains(queryLower, "notification") || strings.Contains(queryLower, "notifications") || strings.Contains(queryLower, "alert") || strings.Contains(queryLower, "permission")
-
-	var filteredMatches []SimilarityMatch
-	for i := range matches {
-		m := matches[i]
-		mType := strings.ToLower(m.Event.Type)
-		mApp := strings.ToLower(m.Event.App)
-		mContent := strings.ToLower(m.Event.Content)
-
-		// 1. Skip self-queries and system notifications unless explicitly requested
-		if mType == "query" && !hasQueryKeyword {
-			continue
-		}
-		if mType == "notification" && !hasNotificationKeyword {
-			continue
-		}
-
-		score := m.Score
-
-		// 2. Boost exact keyword matches in app name or event type
-		for _, word := range strings.Fields(queryLower) {
-			if len(word) < 3 {
-				continue
-			}
-			// Boost if the target keyword is the app or event type
-			if strings.Contains(mApp, word) || strings.Contains(mType, word) {
-				score += 0.40
-			}
-			// Boost if the content contains the word
-			if strings.Contains(mContent, word) {
-				score += 0.15
-			}
-		}
-
-		m.Score = score
-		filteredMatches = append(filteredMatches, m)
-	}
-	matches = filteredMatches
-
-	// Sort matches by cosine score descending
-	sort.Slice(matches, func(i, j int) bool {
-		return matches[i].Score > matches[j].Score
-	})
-
-	// Take top 12 matches
-	topLimit := 12
-	if len(matches) < topLimit {
-		topLimit = len(matches)
-	}
-	topMatches := matches[:topLimit]
-
-	// Re-sort top matches CHRONOLOGICALLY to build context timeline
-	sort.Slice(topMatches, func(i, j int) bool {
-		return topMatches[i].Event.Timestamp < topMatches[j].Event.Timestamp
-	})
-
-	// Format chronological timeline context
-	var timelineBuilder strings.Builder
-	for _, m := range topMatches {
-		timelineBuilder.WriteString(fmt.Sprintf("[%s] [%s] [%s] %s\n",
-			m.Event.Timestamp, strings.ToUpper(m.Event.Type), m.Event.App, m.Event.Content))
-	}
-	timeline := timelineBuilder.String()
-
-	// 4. Fetch Arch Wiki Reference Context
-	var wikiDocs []WikiResult
-	wikiResults, err := searchArchWiki(queryText)
-	if err == nil {
-		wikiDocs = wikiResults
-	}
-
-	var wikiBuilder strings.Builder
-	if len(wikiDocs) > 0 {
-		wikiBuilder.WriteString("\n\nRelevant Arch Wiki Documentation (Reference Fallback):\n")
-		for _, doc := range wikiDocs {
-			wikiBuilder.WriteString(fmt.Sprintf("--- Source: %s ---\n%s\n\n", doc.Source, doc.Content))
-		}
-	}
-	wikiContext := wikiBuilder.String()
-
-	printStyledTimeline(topMatches)
-	fmt.Printf("%s🧠 Generating guidance from your digital twin...%s\n", Green, Reset)
-
-	// Stream guidance response from Groq
-	err = queryGroqLLM(queryText, timeline, wikiContext)
-	if err != nil {
-		fmt.Printf("\n%sError querying LLM: %v%s\n", Red, err, Reset)
-	} else {
-		// Log successful query as a memory
-		logEvent(db, "query", "qareen", "User queried: "+queryText)
-	}
+	fmt.Printf("Coverage: %v\n", answer.Coverage)
 }
 
 type WikiResult struct {
@@ -944,221 +505,12 @@ type WikiResult struct {
 	Source  string `json:"source"`
 }
 
-func searchArchWiki(query string) ([]WikiResult, error) {
-	payload, err := json.Marshal(map[string]interface{}{
-		"query": query,
-		"k":     3,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := http.Post(ServerURL+"/wiki-search", "application/json", bytes.NewBuffer(payload))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("error status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var res struct {
-		Results []WikiResult `json:"results"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return nil, err
-	}
-
-	return res.Results, nil
-}
-
-func queryGroqLLM(query, timeline, wikiContext string) error {
-	apiKey := os.Getenv("GROQ_API_KEY")
-	if apiKey == "" {
-		return fmt.Errorf("GROQ_API_KEY environment variable is not set. Export it (e.g. in ~/.zshrc or ~/.bashrc) before running qareen: export GROQ_API_KEY=\"your-key-here\"")
-	}
-
-	systemContent := "You are Qareen, the user's digital twin assistant. Your role is to guide the user on how they previously resolved an issue, based on their logged activities (timeline). If the user's memory timeline does not contain a clear resolution or solution steps to fix the issue, consult the provided Arch Wiki Documentation (Reference Fallback) to formulate and suggest the correct troubleshooting steps."
-	userContent := fmt.Sprintf("User Query: %s\n\nRelevant Interaction Context (Timeline):\n%s%s", query, timeline, wikiContext)
-
-	requestBody, err := json.Marshal(map[string]interface{}{
-		"model": GroqModel,
-		"messages": []map[string]string{
-			{"role": "system", "content": systemContent},
-			{"role": "user", "content": userContent},
-		},
-		"temperature": 0.2,
-		"stream":      true,
-	})
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequest("POST", "https://api.groq.com/openai/v1/chat/completions", bytes.NewBuffer(requestBody))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP error %d: %s", resp.StatusCode, string(body))
-	}
-
-	fmt.Printf("\n%s%s┌──────────────────────────────────────────────────────────┐%s\n", Green, Bold, Reset)
-	fmt.Printf("%s%s│                 🧠 DIGITAL TWIN GUIDANCE                 │%s\n", Green, Bold, Reset)
-	fmt.Printf("%s%s└──────────────────────────────────────────────────────────┘%s\n", Green, Bold, Reset)
-	fmt.Print("  ")
-
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "data: ") {
-			dataStr := strings.TrimPrefix(line, "data: ")
-			dataStr = strings.TrimSpace(dataStr)
-			if dataStr == "[DONE]" {
-				break
-			}
-			var chunk struct {
-				Choices []struct {
-					Delta struct {
-						Content string `json:"content"`
-					} `json:"delta"`
-				} `json:"choices"`
-			}
-			if err := json.Unmarshal([]byte(dataStr), &chunk); err == nil {
-				if len(chunk.Choices) > 0 {
-					content := chunk.Choices[0].Delta.Content
-					indented := strings.ReplaceAll(content, "\n", "\n  ")
-					fmt.Print(indented)
-				}
-			}
-		}
-	}
-	fmt.Print("\n\n")
-	return nil
-}
-
-func printStyledTimeline(topMatches []SimilarityMatch) {
-	fmt.Printf("\n%s%s┌──────────────────────────────────────────────────────────┐%s\n", Blue, Bold, Reset)
-	fmt.Printf("%s%s│             🗓️  QAREEN DIGITAL TWIN TIMELINE              │%s\n", Blue, Bold, Reset)
-	fmt.Printf("%s%s└──────────────────────────────────────────────────────────┘%s\n", Blue, Bold, Reset)
-	
-	if len(topMatches) == 0 {
-		fmt.Printf("  %s(No events recorded in this time window)%s\n", Gray, Reset)
-		return
-	}
-
-	for i, m := range topMatches {
-		tStr := m.Event.Timestamp
-		if len(tStr) > 19 {
-			tStr = tStr[:19]
-		}
-		timePart := tStr
-		if len(tStr) >= 19 {
-			timePart = tStr[11:16]
-		}
-		
-		icon := "🔵"
-		typeColor := Cyan
-		switch strings.ToLower(m.Event.Type) {
-		case "whatsapp":
-			icon = "💬"
-			typeColor = Green
-		case "chatgpt":
-			icon = "🤖"
-			typeColor = Magenta
-		case "command", "history":
-			icon = "💻"
-			typeColor = Yellow
-		case "tab", "browse":
-			icon = "🌐"
-			typeColor = Blue
-		case "gmail":
-			icon = "📧"
-			typeColor = Red
-		case "meet":
-			icon = "🎥"
-			typeColor = Red
-		case "query":
-			icon = "🕵️‍♂️"
-			typeColor = Cyan
-		}
-
-		branch := "├──"
-		if i == len(topMatches)-1 {
-			branch = "└──"
-		}
-
-		appStr := m.Event.App
-		if appStr == "" {
-			appStr = "system"
-		}
-
-		fmt.Printf("  %s%s %s [%s] %s%s%s • %s\n", 
-			Gray, branch, icon, timePart, typeColor, strings.ToUpper(m.Event.Type), Reset, appStr)
-		
-		indentBranch := "  │  "
-		if i == len(topMatches)-1 {
-			indentBranch = "     "
-		}
-		
-		contentStr := strings.TrimSpace(m.Event.Content)
-		if len(contentStr) > 120 {
-			contentStr = contentStr[:117] + "..."
-		}
-		
-		fmt.Printf("  %s%s %s%s%s\n", Gray, indentBranch, Reset, contentStr, Reset)
-	}
-	fmt.Printf("\n")
-}
-
 // ---------------- UTILITIES & HELPERS ----------------
 
-func getEmbedding(text string) ([]float64, error) {
-	payload, err := json.Marshal(map[string]interface{}{
-		"texts": []string{text},
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := http.Post(ServerURL+"/embed", "application/json", bytes.NewBuffer(payload))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("error status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var res struct {
-		Embeddings [][]float64 `json:"embeddings"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return nil, err
-	}
-
-	if len(res.Embeddings) == 0 {
-		return nil, fmt.Errorf("empty embeddings response")
-	}
-
-	return res.Embeddings[0], nil
-}
-
 func cosineSimilarity(a, b []float64) float64 {
+	if len(a) != len(b) {
+		return 0
+	}
 	var dotProduct, normA, normB float64
 	for i := 0; i < len(a); i++ {
 		dotProduct += a[i] * b[i]
@@ -1174,8 +526,8 @@ func cosineSimilarity(a, b []float64) float64 {
 // scanFirefoxHistory opens placesPath read-only (via SQLite URI mode=ro so it
 // never blocks or is blocked by Firefox's own writer) and logs any visits
 // newer than sinceMicros. Returns the latest visit timestamp seen and
-// whether the scan succeeded (false means the caller should fall back to
-// copy-then-read).
+// whether the scan succeeded. On failure retain the cursor; never copy a live
+// SQLite database without its WAL.
 func scanFirefoxHistory(placesPath string, sinceMicros int64, db *sql.DB) (int64, bool) {
 	dsn := fmt.Sprintf("file:%s?mode=ro", placesPath)
 	roDb, err := sql.Open("sqlite", dsn)
@@ -1188,7 +540,7 @@ func scanFirefoxHistory(placesPath string, sinceMicros int64, db *sql.DB) (int64
 		SELECT h.visit_date, p.url, p.title
 		FROM moz_historyvisits h
 		JOIN moz_places p ON h.place_id = p.id
-		WHERE h.visit_date > ?
+		WHERE h.visit_date >= ?
 		ORDER BY h.visit_date ASC`, sinceMicros)
 	if err != nil {
 		return 0, false
@@ -1200,88 +552,61 @@ func scanFirefoxHistory(placesPath string, sinceMicros int64, db *sql.DB) (int64
 		var visitDate int64
 		var url, title sql.NullString
 		if err := rows.Scan(&visitDate, &url, &title); err == nil {
-			latestVisit = visitDate
+
 			tStr := title.String
 			if tStr == "" {
 				tStr = url.String
 			}
-			logEvent(db, "history", "firefox", fmt.Sprintf("Visited webpage: %s (URL: %s)", tStr, url.String))
+			if !persistEvent(db, "history", "firefox", fmt.Sprintf("Visited webpage: %s (URL: %s)", tStr, url.String), time.UnixMicro(visitDate).UTC(), fmt.Sprintf("%d:%s", visitDate, url.String)) {
+				return latestVisit, false
+			}
+			latestVisit = visitDate
 		}
 	}
-	return latestVisit, true
+	return latestVisit, rows.Err() == nil
 }
 
 func findFirefoxProfile() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
+	if path := os.Getenv("QAREEN_FIREFOX_PROFILE"); path != "" {
+		return path, nil
 	}
-	baseDir := filepath.Join(home, ".mozilla/firefox")
-	files, err := os.ReadDir(baseDir)
-	if err != nil {
-		return "", err
-	}
-	var fallbackPath string
-	for _, f := range files {
-		if f.IsDir() {
-			profilePath := filepath.Join(baseDir, f.Name())
-			placesPath := filepath.Join(profilePath, "places.sqlite")
-			if _, err := os.Stat(placesPath); err == nil {
-				if strings.Contains(f.Name(), "default-release") {
-					return profilePath, nil
-				}
-				fallbackPath = profilePath
+	home, _ := os.UserHomeDir()
+	roots := []string{filepath.Join(home, ".mozilla/firefox"), filepath.Join(home, "snap/firefox/common/.mozilla/firefox"), filepath.Join(home, ".var/app/org.mozilla.firefox/.mozilla/firefox")}
+	var candidates []string
+	for _, root := range roots {
+		data, err := os.ReadFile(filepath.Join(root, "profiles.ini"))
+		if err != nil {
+			continue
+		}
+		sections := parseINI(string(data))
+		for name, values := range sections {
+			if strings.HasPrefix(name, "Install") && values["Default"] != "" {
+				return filepath.Join(root, values["Default"]), nil
 			}
 		}
+		for name, values := range sections {
+			if !strings.HasPrefix(name, "Profile") || values["Path"] == "" {
+				continue
+			}
+			path := values["Path"]
+			if values["IsRelative"] != "0" {
+				path = filepath.Join(root, path)
+			}
+			if values["Default"] == "1" {
+				return path, nil
+			}
+			candidates = append(candidates, path)
+		}
 	}
-	if fallbackPath != "" {
-		return fallbackPath, nil
+	if len(candidates) == 1 {
+		return candidates[0], nil
 	}
-	return "", fmt.Errorf("no profile found")
-}
-
-func copyFile(src, dst string) error {
-	input, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(dst, input, 0644)
-}
-
-func isPidRunning(pidFile string) bool {
-	pidData, err := os.ReadFile(pidFile)
-	if err != nil {
-		return false
-	}
-	pid, err := strconv.Atoi(string(bytes.TrimSpace(pidData)))
-	if err != nil {
-		return false
-	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	// On Unix systems, FindProcess always succeeds. Must send signal 0 to check if alive.
-	err = process.Signal(syscall.Signal(0))
-	return err == nil
-}
-
-func isPortOpen(port string) bool {
-	// Native TCP dial instead of shelling out to `nc`, which may not be
-	// installed on a minimal system and previously caused isPortOpen to
-	// always report false, making `qareen start` spawn duplicate embedding
-	// servers on every invocation.
-	conn, err := net.DialTimeout("tcp", "127.0.0.1:"+port, 300*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	conn.Close()
-	return true
+	return "", fmt.Errorf("set QAREEN_FIREFOX_PROFILE to select a profile")
 }
 
 func listEvents(limit int) {
 	dbPath, _, _, _ := getPaths()
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)")
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		return
@@ -1306,20 +631,12 @@ func listEvents(limit int) {
 }
 
 func clearEvents() {
-	dbPath, _, _, _ := getPaths()
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
+	var result interface{}
+	if err := callAPI("POST", "/api/delete", map[string]interface{}{"all": true}, &result); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
-	defer db.Close()
-
-	_, err = db.Exec("DELETE FROM events")
-	if err == nil {
-		fmt.Printf("%sSuccessfully cleared all logged events from database.%s\n", Green, Reset)
-	} else {
-		fmt.Printf("Error clearing database: %v\n", err)
-	}
+	fmt.Println("Cleared event memory, associated proposals and legacy derived copies.")
 }
 
 func logInfo(format string, args ...interface{}) {
@@ -1508,7 +825,7 @@ func startFileWatcher(db *sql.DB) {
 	defer unix.Close(fd)
 
 	watchToDir := make(map[int32]string)
-	const flags = unix.IN_CREATE | unix.IN_MOVED_TO | unix.IN_DELETE | unix.IN_MOVED_FROM
+	const flags = unix.IN_CREATE | unix.IN_MOVED_TO | unix.IN_DELETE | unix.IN_MOVED_FROM | unix.IN_DELETE_SELF | unix.IN_MOVE_SELF
 
 	for _, dir := range watchDirs {
 		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
@@ -1523,19 +840,30 @@ func startFileWatcher(db *sql.DB) {
 		logInfo("Watching directory for file changes: %s", dir)
 	}
 
-	if len(watchToDir) == 0 {
-		logInfo("No watchable directories found (checked Downloads/Documents/Desktop); file tracking disabled.")
-		return
-	}
-
 	// Debounce: editors/downloaders often fire several inotify events for
 	// the same path within milliseconds of each other (e.g. a temp file then
 	// a rename-into-place). Skip repeats of the same path within this window
 	// so one save doesn't become three near-identical DB rows.
 	lastLogged := make(map[string]time.Time)
 	buf := make([]byte, 4096)
-
+	lastRearm := time.Time{}
 	for {
+		if time.Since(lastRearm) > 5*time.Second {
+			lastRearm = time.Now()
+			for _, dir := range watchDirs {
+				found := false
+				for _, active := range watchToDir {
+					if active == dir {
+						found = true
+					}
+				}
+				if !found {
+					if wd, err := unix.InotifyAddWatch(fd, dir, flags); err == nil {
+						watchToDir[int32(wd)] = dir
+					}
+				}
+			}
+		}
 		n, err := unix.Read(fd, buf)
 		if err != nil {
 			if err == unix.EAGAIN {
@@ -1556,6 +884,13 @@ func startFileWatcher(db *sql.DB) {
 				nameBytes := buf[offset+int(unix.SizeofInotifyEvent) : offset+int(unix.SizeofInotifyEvent)+nameLen]
 				name = strings.TrimRight(string(nameBytes), "\x00")
 			}
+			if raw.Mask&unix.IN_Q_OVERFLOW != 0 {
+				logError("File event queue overflow; capture is incomplete")
+			}
+			if raw.Mask&(unix.IN_IGNORED|unix.IN_DELETE_SELF|unix.IN_MOVE_SELF) != 0 {
+				delete(watchToDir, raw.Wd)
+				unix.InotifyRmWatch(fd, uint32(raw.Wd))
+			}
 			dir := watchToDir[raw.Wd]
 			offset += int(unix.SizeofInotifyEvent) + nameLen
 
@@ -1564,10 +899,21 @@ func startFileWatcher(db *sql.DB) {
 			}
 
 			fullPath := filepath.Join(dir, name)
-			if t, ok := lastLogged[fullPath]; ok && time.Since(t) < 3*time.Second {
+			debounceKey := fmt.Sprintf("%s:%d", fullPath, raw.Mask)
+			if len(lastLogged) > 1024 {
+				for key, t := range lastLogged {
+					if time.Since(t) > 3*time.Second {
+						delete(lastLogged, key)
+					}
+				}
+			}
+			if t, ok := lastLogged[debounceKey]; ok && time.Since(t) < 200*time.Millisecond {
 				continue
 			}
-			lastLogged[fullPath] = time.Now()
+			if len(lastLogged) >= 2048 {
+				clear(lastLogged)
+			}
+			lastLogged[debounceKey] = time.Now()
 
 			var action string
 			switch {
@@ -1629,7 +975,9 @@ func refreshBindsLoop() {
 }
 
 func refreshBinds() {
-	cmd := exec.Command("hyprctl", "binds", "-j")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "hyprctl", "binds", "-j")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	err := cmd.Run()
@@ -1725,24 +1073,25 @@ func getModifierBit(code uint16) int {
 }
 
 func handleInputEvent(db *sql.DB, ev inputEvent) {
-	if ev.Type == 1 { // EV_KEY
-		if isModifier(ev.Code) {
-			if ev.Code == 58 { // Caps Lock
-				if ev.Value == 1 { // Toggle on press
-					activeModifiers ^= 2
-				}
-			} else {
-				if ev.Value == 1 {
-					activeModifiers |= getModifierBit(ev.Code)
-				} else if ev.Value == 0 {
-					activeModifiers &= ^getModifierBit(ev.Code)
-				}
-			}
-		} else if ev.Value == 1 { // Key press only (no release/repeat)
-			keyName := translateKeycode(ev.Code)
-			if keyName != "" {
-				matchAndLogKeybind(db, activeModifiers, keyName)
-			}
+	if ev.Type != 1 {
+		return
+	}
+	if isModifier(ev.Code) {
+		if ev.Code == 58 {
+			return
+		} // Caps Lock is lock-state, not inferred from key presses.
+		if ev.Value == 1 {
+			pressedModifiers[ev.Code] = true
+		} else if ev.Value == 0 {
+			delete(pressedModifiers, ev.Code)
+		}
+		activeModifiers = 0
+		for code := range pressedModifiers {
+			activeModifiers |= getModifierBit(code)
+		}
+	} else if ev.Value == 1 {
+		if key := translateKeycode(ev.Code); key != "" {
+			matchAndLogKeybind(db, activeModifiers, key)
 		}
 	}
 }
@@ -1760,7 +1109,7 @@ func matchAndLogKeybind(db *sql.DB, modmask int, key string) {
 			}
 			logText := fmt.Sprintf("Keybind triggered: %s -> %s", keybindText, actionText)
 
-			logInfo("Keybind Match: %s", logText)
+			logInfo("Keybind matched")
 			logEvent(db, "keybind", "hyprland", logText)
 			break
 		}
@@ -1791,7 +1140,9 @@ func sendKeybindNotification(keybind, dispatcher, arg string) {
 		actionText += " " + arg
 	}
 	// Trigger desktop notification routed to swaync
-	cmd := exec.Command("notify-send", "-a", "Qareen", "-i", "keyboard", keybind, "Action: "+actionText)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "notify-send", "-a", "Qareen", "-i", "keyboard", keybind, "Action: "+actionText)
 	cmd.Run()
 }
 
@@ -1958,209 +1309,24 @@ func translateKeycode(code uint16) string {
 // ---------------- WEB DASHBOARD ----------------
 
 func serveDashboard() {
-	dbPath, _, _, _ := getPaths()
-	db, err := sql.Open("sqlite", dbPath+"?mode=ro")
-	if err != nil {
-		fmt.Printf("%sError opening database: %v%s\n", Red, err, Reset)
-		return
-	}
-	defer db.Close()
-
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) { handleAPIEvents(w, r, db) })
-	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) { handleAPISearch(w, r) })
-	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) { handleAPIStats(w, r, db) })
-
+	mux.HandleFunc("/api/", proxyAPI)
 	sub, _ := fs.Sub(dashboardFS, "dashboard")
 	mux.Handle("/", http.FileServer(http.FS(sub)))
-
-	fmt.Printf("%s%sQareen Dashboard running at http://localhost:%s%s\n", Green, Bold, DashboardPort, Reset)
-	fmt.Printf("Press Ctrl+C to stop.\n")
-	if err := http.ListenAndServe("127.0.0.1:"+DashboardPort, mux); err != nil {
-		fmt.Printf("%sError starting dashboard: %v%s\n", Red, err, Reset)
-	}
-}
-
-func jsonResponse(w http.ResponseWriter, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
-}
-
-func handleAPIEvents(w http.ResponseWriter, r *http.Request, db *sql.DB) {
-	q := r.URL.Query()
-	limit, _ := strconv.Atoi(q.Get("limit"))
-	if limit <= 0 || limit > 500 {
-		limit = 50
-	}
-	offset, _ := strconv.Atoi(q.Get("offset"))
-	if offset < 0 {
-		offset = 0
-	}
-	filterType := q.Get("type")
-	filterApp := q.Get("app")
-
-	where := ""
-	var args []interface{}
-	var conditions []string
-	if filterType != "" {
-		conditions = append(conditions, "event_type = ?")
-		args = append(args, filterType)
-	}
-	if filterApp != "" {
-		conditions = append(conditions, "app = ?")
-		args = append(args, filterApp)
-	}
-	if len(conditions) > 0 {
-		where = " WHERE " + strings.Join(conditions, " AND ")
-	}
-
-	var total int
-	countQuery := "SELECT COUNT(*) FROM events" + where
-	db.QueryRow(countQuery, args...).Scan(&total)
-
-	query := "SELECT id, timestamp, event_type, app, content FROM events" + where + " ORDER BY id DESC LIMIT ? OFFSET ?"
-	queryArgs := append(args, limit, offset)
-	rows, err := db.Query(query, queryArgs...)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	defer rows.Close()
-
-	type EventJSON struct {
-		ID        int    `json:"id"`
-		Timestamp string `json:"timestamp"`
-		EventType string `json:"event_type"`
-		App       string `json:"app"`
-		Content   string `json:"content"`
-	}
-	var events []EventJSON
-	for rows.Next() {
-		var ev EventJSON
-		if rows.Scan(&ev.ID, &ev.Timestamp, &ev.EventType, &ev.App, &ev.Content) == nil {
-			events = append(events, ev)
+	mux.Handle("/dashboard/", http.StripPrefix("/dashboard/", http.FileServer(http.FS(sub))))
+	secure := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "127.0.0.1:2847" && r.Host != "localhost:2847" {
+			http.Error(w, "Invalid host", 403)
+			return
 		}
-	}
-	if events == nil {
-		events = []EventJSON{}
-	}
-	jsonResponse(w, map[string]interface{}{"events": events, "total": total})
-}
-
-func handleAPISearch(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query().Get("q")
-	if q == "" {
-		http.Error(w, "missing query parameter 'q'", 400)
-		return
-	}
-	k := 12
-	if kStr := r.URL.Query().Get("k"); kStr != "" {
-		if kVal, err := strconv.Atoi(kStr); err == nil && kVal > 0 {
-			k = kVal
-		}
-	}
-
-	payload, _ := json.Marshal(map[string]interface{}{"query": q, "k": k})
-	resp, err := http.Post(ServerURL+"/search", "application/json", bytes.NewBuffer(payload))
-	if err != nil {
-		http.Error(w, "search service unavailable: "+err.Error(), 502)
-		return
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(body)
-}
-
-func handleAPIStats(w http.ResponseWriter, r *http.Request, db *sql.DB) {
-	type LabelCount struct {
-		Label string `json:"label"`
-		Count int    `json:"count"`
-	}
-	type HourCount struct {
-		Hour  int `json:"hour"`
-		Count int `json:"count"`
-	}
-	type DayCount struct {
-		Date  string `json:"date"`
-		Count int    `json:"count"`
-	}
-
-	var total, today, thisWeek, uniqueApps int
-	db.QueryRow("SELECT COUNT(*) FROM events").Scan(&total)
-	db.QueryRow("SELECT COUNT(*) FROM events WHERE timestamp >= date('now')").Scan(&today)
-	db.QueryRow("SELECT COUNT(*) FROM events WHERE timestamp >= date('now', '-7 days')").Scan(&thisWeek)
-	db.QueryRow("SELECT COUNT(DISTINCT app) FROM events").Scan(&uniqueApps)
-
-	var byType []LabelCount
-	rows, _ := db.Query("SELECT event_type, COUNT(*) as cnt FROM events GROUP BY event_type ORDER BY cnt DESC")
-	if rows != nil {
-		defer rows.Close()
-		for rows.Next() {
-			var lc LabelCount
-			if rows.Scan(&lc.Label, &lc.Count) == nil {
-				byType = append(byType, lc)
-			}
-		}
-	}
-
-	var topApps []LabelCount
-	rows2, _ := db.Query("SELECT app, COUNT(*) as cnt FROM events GROUP BY app ORDER BY cnt DESC LIMIT 20")
-	if rows2 != nil {
-		defer rows2.Close()
-		for rows2.Next() {
-			var lc LabelCount
-			if rows2.Scan(&lc.Label, &lc.Count) == nil {
-				topApps = append(topApps, lc)
-			}
-		}
-	}
-
-	byHour := make([]HourCount, 24)
-	for i := range byHour {
-		byHour[i].Hour = i
-	}
-	rows3, _ := db.Query("SELECT CAST(strftime('%H', timestamp) AS INTEGER) as h, COUNT(*) FROM events GROUP BY h ORDER BY h")
-	if rows3 != nil {
-		defer rows3.Close()
-		for rows3.Next() {
-			var h, c int
-			if rows3.Scan(&h, &c) == nil && h >= 0 && h < 24 {
-				byHour[h].Count = c
-			}
-		}
-	}
-
-	var byDay []DayCount
-	rows4, _ := db.Query("SELECT date(timestamp) as d, COUNT(*) FROM events WHERE timestamp >= date('now', '-30 days') GROUP BY d ORDER BY d")
-	if rows4 != nil {
-		defer rows4.Close()
-		for rows4.Next() {
-			var dc DayCount
-			if rows4.Scan(&dc.Date, &dc.Count) == nil {
-				byDay = append(byDay, dc)
-			}
-		}
-	}
-
-	if byType == nil {
-		byType = []LabelCount{}
-	}
-	if topApps == nil {
-		topApps = []LabelCount{}
-	}
-	if byDay == nil {
-		byDay = []DayCount{}
-	}
-
-	jsonResponse(w, map[string]interface{}{
-		"total":       total,
-		"today":       today,
-		"this_week":   thisWeek,
-		"unique_apps": uniqueApps,
-		"by_type":     byType,
-		"top_apps":    topApps,
-		"by_hour":     byHour,
-		"by_day":      byDay,
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "no-store")
+		mux.ServeHTTP(w, r)
 	})
+	fmt.Println("Dashboard: http://127.0.0.1:2847 (enter the token from qareen token admin)")
+	server := &http.Server{Addr: "127.0.0.1:2847", Handler: secure, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 90 * time.Second, IdleTimeout: 30 * time.Second}
+	if err := server.ListenAndServe(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+	}
 }

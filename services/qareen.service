@@ -1,0 +1,16 @@
+[Unit]
+Description=Qareen opt-in desktop event collector
+Wants=qareen-embedding.service
+After=qareen-embedding.service graphical-session.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/qareen/environment
+ExecStart="%h/.local/bin/qareen" run-daemon
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,4 @@
+-r requirements.txt
+google-auth==2.41.1
+google-auth-oauthlib==1.2.3
+keyring==25.7.0

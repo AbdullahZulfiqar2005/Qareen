@@ -1,0 +1,6 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Qareen companion settings</title>
+<body><h1>Qareen companion</h1><p>Capture is off until you select sources. Private windows are excluded. Only rendered messages and explicitly selected WhatsApp text are captured.</p>
+<form id="settings"><label>Ingestion token (run <code>qareen token ingest</code>) <input id="token" type="password" autocomplete="off"></label>
+<p><label><input type="checkbox" id="chatgpt">ChatGPT rendered messages</label></p><p><label><input type="checkbox" id="whatsapp">WhatsApp explicit selections</label></p><p><label><input type="checkbox" id="google-meet">Meet visible captions (partial)</label></p>
+<p><label><input type="checkbox" id="paused">Pause extension capture and delivery</label></p><button>Save</button></form>
+<p>The local retry queue expires after seven days and is limited to 500 events / approximately 4 MB. Browser storage is not encrypted. Deleting the queue prevents delayed delivery.</p><button id="clear">Delete pending queue</button><pre id="status" role="status"></pre><script src="options.js"></script></body></html>
