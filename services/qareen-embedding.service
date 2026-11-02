@@ -1,0 +1,17 @@
+[Unit]
+Description=Qareen local memory and proposal service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/qareen/app
+EnvironmentFile=-%h/.config/qareen/environment
+ExecStart="%h/.local/share/qareen/app/.venv/bin/python" "%h/.local/share/qareen/app/embedding_server.py"
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=65
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -1,47 +1,51 @@
 name: CI
-
-on:
-  push:
-    branches: [master]
-  pull_request:
-    branches: [master]
-
+on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
-  go-tests:
+  go:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version-file: go.mod
       - run: go vet ./...
-      - run: go test -v -race ./...
-
-  python-tests:
+      - run: go test -race ./...
+      - run: go build ./...
+  python:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.12'
       - run: pip install -r requirements.txt -r dev-requirements.txt
-      - run: python -m pytest test_embedding_server.py -v
-
-  extension-tests:
+      - run: python -m pytest -q
+      - run: ruff check .
+      - run: ruff format --check .
+  extension:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '22'
       - run: node --test extension/test_content.test.js
-
-  lint:
+      - run: node --check dashboard/app.js && node --check extension/content.js && node --check extension/background.js
+  dashboard:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - run: pip install ruff
-      - run: ruff check *.py
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: pip install -r requirements.txt
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium --only-shell
+      - run: npm run test:ui
+        env:
+          QAREEN_TEST_PYTHON: python

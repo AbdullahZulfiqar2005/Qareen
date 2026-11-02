@@ -1,70 +1,9 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Qareen Dashboard</title>
-  <link rel="stylesheet" href="style.css">
-</head>
-<body>
-  <header>
-    <h1>Qareen</h1>
-    <nav>
-      <button class="tab-btn active" data-tab="timeline">Timeline</button>
-      <button class="tab-btn" data-tab="search">Search</button>
-      <button class="tab-btn" data-tab="analytics">Analytics</button>
-    </nav>
-  </header>
-
-  <main>
-    <!-- Timeline -->
-    <section id="tab-timeline" class="tab-content active">
-      <div class="filters">
-        <select id="filter-type"><option value="">All types</option></select>
-        <select id="filter-app"><option value="">All apps</option></select>
-        <button id="filter-apply">Filter</button>
-      </div>
-      <div id="timeline-list"></div>
-      <div class="pagination">
-        <button id="prev-page" disabled>← Prev</button>
-        <span id="page-info"></span>
-        <button id="next-page">Next →</button>
-      </div>
-    </section>
-
-    <!-- Search -->
-    <section id="tab-search" class="tab-content">
-      <div class="search-bar">
-        <input id="search-input" type="text" placeholder="Search your memory…" autocomplete="off">
-        <button id="search-btn">Search</button>
-      </div>
-      <div id="search-results"></div>
-    </section>
-
-    <!-- Analytics -->
-    <section id="tab-analytics" class="tab-content">
-      <div id="stat-cards" class="stat-cards"></div>
-      <div class="charts-grid">
-        <div class="chart-box">
-          <h3>Activity by Hour</h3>
-          <div id="chart-hour" class="bar-chart"></div>
-        </div>
-        <div class="chart-box">
-          <h3>Events by Type</h3>
-          <div id="chart-type" class="bar-chart"></div>
-        </div>
-        <div class="chart-box">
-          <h3>Top Apps</h3>
-          <div id="chart-app" class="bar-chart"></div>
-        </div>
-        <div class="chart-box wide">
-          <h3>Daily Activity (Last 30 Days)</h3>
-          <div id="chart-daily" class="bar-chart horizontal"></div>
-        </div>
-      </div>
-    </section>
-  </main>
-
-  <script src="app.js"></script>
-</body>
-</html>
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Qareen · Local memory</title><link rel="stylesheet" href="/dashboard/style.css"></head><body>
+<header><a href="/">Qareen <span>local memory</span></a><button id="refresh">Refresh</button><button id="lock">Lock</button></header>
+<main><section id="unlock"><h1>Your memory, under your control.</h1><p>Connect to your local service with the admin token from <code>qareen token admin</code>. The token stays in this tab’s session.</p><form id="login"><input id="token" type="password" placeholder="Admin token" aria-label="Admin token" required autocomplete="off"><button>Unlock</button></form></section>
+<p id="notice" role="status" aria-live="polite"></p><div id="workspace" hidden>
+<nav><button data-panel="timeline">Memory</button><button data-panel="inbox">Proposals</button><button data-panel="settings">Privacy & health</button></nav>
+<section id="timeline" class="panel"><h1>Ask your memory</h1><p>Answers cite captured events. Incomplete capture is shown as incomplete evidence.</p><form id="ask"><input id="query" required placeholder="What did I work on yesterday?" aria-label="Question"><button>Ask</button><button type="button" id="search">Search locally</button></form><pre id="answer"></pre><p id="coverage"></p><div class="filters"><label>Source <select id="source"><option value="">All sources</option></select></label><label>App <select id="app"><option value="">All apps</option></select></label><button id="timeline-load">Latest events</button></div><div id="events"></div><button id="more">Load more</button></section>
+<section id="inbox" class="panel" hidden><h1>Review proposals</h1><p>Editing resets approval. Gmail export creates a draft only. Qareen never sends messages or runs proposed commands.</p><div id="proposals"></div></section>
+<section id="settings" class="panel" hidden><h1>Privacy & health</h1><form id="preferences"><p><label><input id="paused" type="checkbox"> Pause all collection</label></p><p><label><input id="auto_proposals" type="checkbox"> Generate proposals for new eligible mail and errors</label></p><p><label><input id="gmail_enabled" type="checkbox"> Enable configured Gmail connector</label></p><div id="source-settings"></div><div class="grid"><label>Keep events (days)<input id="retention_days" type="number" min="1" max="3650"></label><label>Daily model calls<input id="daily_call_limit" type="number" min="0" max="1000"></label><label>Timezone<input id="timezone" placeholder="Asia/Karachi"></label><label>Gmail label<input id="gmail_label"></label></div><label>Writing preferences (JSON)<textarea id="writing" rows="4"></textarea></label><button>Save settings</button></form><p>Cloud sharing starts disabled. Selected sources, your question, approved writing examples, and preferences may be sent to Groq when generation runs. Redaction is best effort. Local storage is not encrypted.</p><button id="gmail-sync">Sync Gmail now</button><button id="export">Export local events</button><button id="delete-all" class="danger">Delete all local events & proposals</button><h2>Service status</h2><pre id="health"></pre></section>
+</div></main><footer>Capture → evidence → draft → your review</footer><script src="/dashboard/app.js"></script></body></html>

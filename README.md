@@ -1,99 +1,81 @@
----
-mainfont: "Open Sans"
----
+# Qareen
 
-# Qareen — Personal Digital Twin
+Local activity memory and a **proposal-only assistant** for Linux developers. Qareen collects selected desktop events, retrieves evidence from your history, and drafts replies or incident advice for your review. It never sends a message or executes a proposed command.
 
-Qareen logs your local activity (shell commands, active window/browser titles, Firefox history, WhatsApp Web / ChatGPT / Claude / Gemini / Grok / Groq / Google Meet text via a companion extension, system journal errors, desktop notifications, and file creation/deletion in your Downloads/Documents/Desktop), embeds each event, and lets you later ask "how did I fix X before?" — it retrieves the most semantically relevant past events and asks an LLM (Groq) to summarize the steps you took.
+This is an engineering preview, with a runnable synthetic demo and regression tests. Live Gmail OAuth, Hyprland, and browser behavior require validation on your machine before everyday use.
 
-Requires `dbus` (for the `dbus-monitor` binary used to perceive desktop notifications) in addition to the Python/Go dependencies below - this is already installed on virtually all Linux desktops.
+## What works
 
-## Components
+- Go collectors for Bash/Zsh history, Firefox history/tabs, desktop notifications, shallow file events, journal errors, and Hyprland windows. Shortcut capture is separately opt-in.
+- SQLite WAL storage with stable source identities, UTC timestamps, FTS5, retryable embedding enrichment, redaction, retention, deletion, and export.
+- Local keyword + vector retrieval with event citations, bounded candidate search, interval-aware summaries, and explicit coverage. Local embeddings use one warm MiniLM model; cloud answers use Groq only for enabled sources.
+- Background proposal jobs with budgets, retries, approval revisions, expiry, stale-context invalidation, and feedback from approved edits.
+- Gmail history sync through the official API. Approved replies can be exported to Gmail **Drafts**. No send endpoint is implemented.
+- Firefox companion: opted-in ChatGPT rendered messages, explicit WhatsApp message selections, and partial visible Meet captions. A durable, bounded local queue retries delivery.
+- Authenticated dashboard with memory search, proposal review, privacy settings, source filters, and service/usage status.
 
-| Component              | Role                                                                 |
-|-------------------------|----------------------------------------------------------------------|
-| `main.go` → `qareen`     | CLI + background daemon. Tracks activity, stores events in SQLite, serves the developer dashboard, and implements a styled terminal output. |
-| `embedding_server.py`   | Local HTTP server (127.0.0.1:2846). Embeds text, runs hybrid vector/chronological query routing, and receives browser extension logs. |
-| `extension/`            | MV3 browser extension that captures WhatsApp/ChatGPT/Claude/Gemini/Grok/Groq/Gmail/Meet text and forwards it. |
-| `chat.py`               | Interactive agentic Arch Linux troubleshooter (RAG over the Arch Wiki + shell tools). |
-| `hyprland_monitor.py`   | Watches Hyprland logs/crash reports and asks the LLM for a diagnosis. |
-| `embedding_script.py`   | One-time offline script that builds the local Arch Wiki FAISS index. |
-| `qareen_embeddings.py`  | Shared client so `chat.py`/`hyprland_monitor.py` reuse the already-running embedding server instead of loading the model again. |
-| `qareen_dotenv.py`      | Shared `.env` loader used by `chat.py`/`hyprland_monitor.py`/the rofi UI. |
-| `rofi_ui/`              | Rofi-based prompt bar for Hyprland - ask your digital twin a question via keybind and get the answer in a styled popup. See `rofi_ui/README.md`. |
+Qareen retrieves past behavior; it does **not** fine-tune a model or prove that a past command fixed a problem. An observed command, received message, and approved proposal are separate facts.
 
-## Setup
+## Try it without personal data or API keys
+
+Requirements: Linux, Python 3.12+, and a browser. Go is needed only for desktop collectors/CLI; use the version in `go.mod`.
 
 ```bash
-# 1. Python deps (use a venv — the daemon expects it at ~/venv)
-python -m venv ~/venv
-source ~/venv/bin/activate
-pip install -r requirements.txt
-
-# 2. Groq API key (required)
-# Drop it in a .env file to be picked up automatically:
-mkdir -p ~/.config/qareen
-cp .env.example ~/.config/qareen/.env
-$EDITOR ~/.config/qareen/.env   # fill in GROQ_API_KEY=your-key-here
-
-# 3. Build the Go binary
-go build -o qareen .
-sudo mv qareen /usr/local/bin/   # or anywhere on your $PATH
-
-# 4. (Optional) Build the Arch Wiki index once:
-python embedding_script.py
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+mkdir -p /tmp/qareen-demo
+chmod 700 /tmp/qareen-demo
+export QAREEN_DATA_DIR=/tmp/qareen-demo/private
+export QAREEN_DB_PATH=/tmp/qareen-demo/events.db
+.venv/bin/python scripts/demo.py --db "$QAREEN_DB_PATH"
+.venv/bin/python embedding_server.py --demo
 ```
 
-## Systemd User Services
+Open `http://127.0.0.1:2846`. In another terminal, read `/tmp/qareen-demo/private/admin.token` and paste it into the dashboard. Try “SQLite”, review the synthetic WhatsApp proposal, edit it, then approve the new revision. The demo provider is confined to fixture creation; the service does not silently fake AI answers. Demo vectors are deterministic word hashes, **not semantic embeddings**.
 
-You can configure Qareen to run automatically in user-space upon login:
+## Install for your desktop
 
-1. Copy the services to your systemd user configuration directory:
-   ```bash
-   mkdir -p ~/.config/systemd/user/
-   cp qareen.service qareen-embedding.service ~/.config/systemd/user/
-   ```
-2. Enable and start the services:
-   ```bash
-   systemctl --user daemon-reload
-   systemctl --user enable --now qareen-embedding.service qareen.service
-   ```
-3. Control services using standard systemd tools:
-   ```bash
-   systemctl --user restart qareen.service
-   systemctl --user status qareen.service
-   ```
-
-## Usage
+Back up an existing database and stop older Qareen processes first. See [migration](docs/MIGRATION.md).
 
 ```bash
-qareen start           # starts the embedding server + tracking daemon
-qareen status          # checks daemon status and database stats
-qareen query "how did I fix the wifi driver issue last time?"
-qareen list 50         # lists recent events
-qareen stop            # cleanly shuts down running services
+scripts/install.sh --ml    # or --demo for the lightweight backend
+~/.local/bin/qareen start
+~/.local/bin/qareen doctor
+~/.local/bin/qareen token admin
 ```
 
----
+The installer creates user services but does not start or enable collection automatically. `qareen start` starts collection. Open the dashboard on port 2846; `qareen dashboard` optionally serves the same UI on port 2847. `qareen pause`, `qareen resume`, and `qareen stop` control collection. Use `systemctl --user enable qareen.service qareen-embedding.service` only if you want login startup.
 
-## What's New & Fixed in this update
+For cloud generation, put `GROQ_API_KEY=...` in the private `~/.config/qareen/environment`, restart the embedding service, then explicitly enable cloud sharing for selected sources in the dashboard. Capture and cloud sharing are separate controls. Default cloud budget: 20 calls/day; default retention: 90 days. Set your timezone in the dashboard.
 
-- **Memory Minimization (Reduced RSS by ~60%)**: Optimized the Python embedding server memory footprint. By disabling PyTorch autograd gradients, avoiding unused GPU allocation (`CUDA_VISIBLE_DEVICES=""`), and limiting threads (`OMP_NUM_THREADS="1"`), RSS memory consumption has dropped from ~950MB to **under 399MB**.
-- **Systemd User Integration**: Integrated background processes with systemd user services while maintaining full compatibility with the Go binary commands (e.g. `qareen status`, `qareen stop`) via unified `/tmp` PID tracking locks.
-- **Dynamic WhatsApp Scraper**:
-  - **Self-Learning User Identity**: The extension automatically identifies your real profile name dynamically by matching new message bubbles against your typed input, allowing accurate outgoing/incoming classification.
-  - **Classname Independence**: Avoids hardcoded class selectors (like `.message-out`) and uses checkmark existence checks combined with unique message ID (`data-id` starts with `true_`) for classification.
-  - **Noisy Tooltip Filters**: Ignores meta strings like `"click here for contact info"` or `"click here for group info"` in group headers.
-- **Temporal Query Routing**: Queries about time ranges (e.g. *"Summarize my day"*, *"what did I do today"*, *"last 2 hours"*) are automatically routed to perform direct SQLite chronological queries, ensuring the LLM is given 100% accurate context for your day's activities.
-- **Premium Terminal UI Styling**: The command `qareen query` now prints a highly polished visual timeline showing tree branches (`├──`, `└──`) and icons matching each category (💬 for WhatsApp, 🤖 for ChatGPT/Gemini, 💻 for commands), and indents the LLM streaming guidance to make it easier to read.
-- **Expanded AI Scrapers**: Added full user prompt & assistant response observers for Claude, Gemini, Groq Playground, and xAI Grok.
-- **Chess Match Outcome Tracking**: Periodically monitors active matches on `chess.com` and `lichess.org` to record your final game outcomes exactly once per match (e.g., `Chess.com match finished: You Won! (by Resignation)` or `Lichess match finished: Black is victorious • Mate`).
+For Gmail, install `requirements-gmail.txt` in the application's venv and follow [Gmail setup](docs/GMAIL.md). Enable automatic proposals only after reviewing the manual workflow.
 
----
+For Firefox, load `extension/manifest.json` through `about:debugging` for temporary testing, open its options, enter `qareen token ingest`, and opt in to sources. `./package_extension.sh` packages all extension assets; permanent Firefox installation requires Mozilla signing. Chromium packaging is not included.
 
-## Known limitations / ideas for next steps
+## Development and validation
 
-- **No encryption at rest.** `~/.qareen.db` holds a very sensitive record of everything you've typed, browsed, and said in meetings, in plaintext SQLite.
-- **No log rotation.** `~/.qareen.log` grows forever; wire it into `logrotate` or cap it in-app.
-- **No retention/pruning policy.** The `events` table grows forever. A `qareen prune --older-than 90d` command would keep the DB size bounded.
-- **File watcher is non-recursive.** `startFileWatcher()` watches `~/Downloads`, `~/Documents`, and `~/Desktop` themselves but not their subdirectories.
+```bash
+.venv/bin/pip install -r dev-requirements.txt
+go test -race ./...
+go vet ./...
+go build ./...
+.venv/bin/python -m pytest -q
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+node --test extension/test_content.test.js
+# Optional real-browser dashboard check:
+npm ci
+npx playwright install chromium --only-shell
+npm run test:ui
+.venv/bin/python scripts/evaluate.py --events 10000
+```
+
+[Architecture](docs/ARCHITECTURE.md) · [Privacy and data boundaries](docs/PRIVACY.md) · [Review fixes and limitations](docs/IMPLEMENTATION.md) · [Validation record](docs/VALIDATION.md)
+
+## Limits to understand
+
+Qareen is not complete system-wide recording. History may be unflushed, notifications incomplete, and DOM selectors unstable. WhatsApp assistance requires selecting a one-to-one incoming message and confirming its contact identifier; it does not scrape an entire account. Gmail's initial import is bounded to 50 messages and 30 messages per thread. Browser adapters for other providers are not enabled in this preview.
+
+Local data is plaintext with private filesystem permissions. Redaction is best effort. Optional cloud generation shares selected evidence, questions, preferences, and approved examples. Semantic candidates are capped at 5,000 matching recent events; keyword search covers the full retained history. Read the privacy document before collecting sensitive data.
+
+The repository does not currently declare a distribution license. Its owner should choose one before inviting third-party redistribution; this implementation does not make that choice on their behalf.

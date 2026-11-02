@@ -1,180 +1,61 @@
-const API = '';
-const PAGE_SIZE = 50;
-
-let currentPage = 0;
-let currentType = '';
-let currentApp = '';
-let totalEvents = 0;
-
-// Tab switching
-document.querySelectorAll('.tab-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.tab-content').forEach(s => s.classList.remove('active'));
-    btn.classList.add('active');
-    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
-    if (btn.dataset.tab === 'analytics') loadAnalytics();
-  });
-});
-
-// --- Badge helpers ---
-function badgeClass(type) {
-  const map = {
-    window: 'badge-window', shell: 'badge-shell', browser: 'badge-browser',
-    tabs: 'badge-tabs', syslog: 'badge-syslog', keybind: 'badge-keybind',
-    notify: 'badge-notify', file: 'badge-file', query: 'badge-query',
-  };
-  return map[type] || 'badge-default';
+'use strict';
+const $ = id => document.getElementById(id);
+let token = sessionStorage.getItem('qareen-token') || '', offset = 0, settings;
+const sources = ['window','command','history','tab','error','notification','file','keybind','query','browse','chatgpt','claude','gemini','grok','groq','whatsapp','gmail','google-meet','linkedin','instagram','reddit','github','chess','system'];
+function el(tag, text, cls) { const n = document.createElement(tag); if(text !== undefined) n.textContent = text; if(cls) n.className = cls; return n; }
+function notice(message) { $('notice').textContent = message; }
+async function api(path, body) {
+  const response = await fetch(path, {method: body === undefined ? 'GET' : 'POST', headers: {Authorization: `Bearer ${token}`, 'Content-Type': 'application/json'}, ...(body === undefined ? {} : {body: JSON.stringify(body)})});
+  const result = await response.json(); if(!response.ok) throw new Error(result.error || `HTTP ${response.status}`); return result;
 }
-
-function eventCard(ev) {
-  return `<div class="event-card">
-    <span class="event-badge ${badgeClass(ev.event_type)}">${ev.event_type}</span>
-    <div class="event-meta">
-      <div class="event-content">${escHtml(ev.content)}</div>
-      <div class="event-footer">
-        <span>${escHtml(ev.timestamp)}</span>
-        ${ev.app ? `<span>${escHtml(ev.app)}</span>` : ''}
-      </div>
-    </div>
-  </div>`;
+function action(node, callback) { node.addEventListener('click', async () => { node.disabled = true; try { await callback(); } catch(e) { notice(e.message); } finally { node.disabled = false; } }); }
+function button(text, callback) { const b=el('button',text); action(b,callback); return b; }
+function showEvent(event) {
+  const card=el('article',undefined,'card');
+  card.append(el('div',`[event:${event.id}] · ${event.event_type} · ${event.action} · ${event.timestamp} · ${event.app || ''}`,'meta'),el('div',event.content,'content'));
+  if (event.event_type==='error' || ['gmail','whatsapp'].includes(event.event_type) && event.direction==='incoming') card.append(button('Draft proposal',async()=>{await api('/api/proposals/create',{event_id:event.id,type:event.event_type==='error'?'incident':'reply'}); notice('Proposal created. Open Proposals to review.'); await loadProposals();}));
+  card.append(button('Delete event',async()=>{await api('/api/delete',{ids:[event.id]});card.remove();notice('Event and dependent proposals deleted.');}));
+  return card;
 }
-
-function escHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+async function loadEvents(append=false) {
+  if(!append) { offset=0; $('events').replaceChildren(); }
+  const data=await api('/api/events?'+new URLSearchParams({offset,limit:50,type:$('source').value,app:$('app').value}));
+  data.events.forEach(e=>$('events').append(showEvent(e)));offset+=data.events.length;$('more').hidden=offset>=data.total;
 }
-
-// --- Timeline ---
-async function loadTimeline() {
-  const offset = currentPage * PAGE_SIZE;
-  const params = new URLSearchParams({ limit: PAGE_SIZE, offset });
-  if (currentType) params.set('type', currentType);
-  if (currentApp) params.set('app', currentApp);
-
-  const res = await fetch(`${API}/api/events?${params}`);
-  const data = await res.json();
-  totalEvents = data.total || 0;
-
-  const list = document.getElementById('timeline-list');
-  if (!data.events || data.events.length === 0) {
-    list.innerHTML = '<div class="empty">No events found.</div>';
-  } else {
-    list.innerHTML = data.events.map(eventCard).join('');
+async function loadProposals() {
+  const data=await api('/api/proposals');$('proposals').replaceChildren();
+  if(!data.proposals.length) $('proposals').append(el('p','No proposals yet. Select an incoming message or error in Memory to create one.'));
+  for(const p of data.proposals) {
+    const card=el('article',undefined,'card'); card.append(el('div',`${p.type} · ${p.status} · revision ${p.revision} · ${p.recipient_ids.join(', ') || 'local advice'}`,'meta'));
+    const area=el('textarea');area.value=p.content;area.rows=7;area.setAttribute('aria-label','Proposal content');area.readOnly=!['proposed','approved'].includes(p.status);card.append(area);
+    card.append(el('p',`Evidence: ${p.source_refs.map(id=>`[event:${id}]`).join(' ')} · Expires: ${p.expires_at} UTC`));
+    const evidence=el('details'); evidence.append(el('summary','View source evidence'));
+    action(evidence.firstChild,async()=>{if(evidence.children.length>1)return;const all=await api('/api/events?limit=500');for(const id of p.source_refs){let e=all.events.find(x=>x.id===id);if(!e)e=await api('/api/event?id='+id);if(e)evidence.append(showEvent(e));}});card.append(evidence);
+    if(['proposed','approved'].includes(p.status)) {
+      const decide=async decision=>{if(decision==='approved' && area.value!==p.content)throw new Error('Save your edits, then review the new revision before approving.');await api('/api/proposals/decide',{id:p.id,revision:p.revision,decision,content:area.value});await loadProposals();};
+      card.append(button('Save edits',()=>decide('edited')),button('Approve this revision',()=>decide('approved')),button('Reject',()=>decide('rejected')));
+      if(p.status==='approved' && p.type==='reply' && p.source==='gmail') card.append(button('Export Gmail draft',async()=>{const r=await api('/api/proposals/export',{id:p.id,revision:p.revision});notice(`Gmail draft created: ${r.draft_id}. It has not been sent.`);await loadProposals();}));
+    }
+    if(p.status==='approved') card.append(button('Copy approved text',async()=>{await navigator.clipboard.writeText(p.content);notice('Approved text copied.');}));
+    if(p.export_state==='unknown') card.append(el('p','Export outcome is uncertain. Retry export to reconcile; inspect Gmail manually if no exact match is found.'));
+    $('proposals').append(card);
   }
-
-  document.getElementById('page-info').textContent =
-    `${offset + 1}–${Math.min(offset + PAGE_SIZE, totalEvents)} of ${totalEvents}`;
-  document.getElementById('prev-page').disabled = currentPage === 0;
-  document.getElementById('next-page').disabled = offset + PAGE_SIZE >= totalEvents;
 }
-
-async function populateFilters() {
-  const res = await fetch(`${API}/api/stats`);
-  const data = await res.json();
-
-  const typeSelect = document.getElementById('filter-type');
-  (data.by_type || []).forEach(({ label }) => {
-    const opt = document.createElement('option');
-    opt.value = label; opt.textContent = label;
-    typeSelect.appendChild(opt);
-  });
-
-  const appSelect = document.getElementById('filter-app');
-  (data.top_apps || []).forEach(({ label }) => {
-    const opt = document.createElement('option');
-    opt.value = label; opt.textContent = label;
-    appSelect.appendChild(opt);
-  });
+async function loadSettings() {
+  settings=await api('/api/settings');for(const key of ['paused','auto_proposals','gmail_enabled'])$(key).checked=settings[key];for(const key of ['retention_days','daily_call_limit','timezone','gmail_label'])$(key).value=settings[key];$('writing').value=JSON.stringify(settings.preferences,null,2);
+  $('source-settings').replaceChildren();for(const source of sources){const row=el('div');row.append(el('strong',source+' '));for(const [key,title,checked] of [['capture','capture',!settings.excluded_sources.includes(source)],['cloud','cloud',settings.cloud_sources.includes(source)]]){const label=el('label'),box=el('input');box.type='checkbox';box.id=`${key}-${source}`;box.checked=checked;label.append(box,document.createTextNode(title+' '));row.append(label);}$('source-settings').append(row);}
+  const stats=await api('/api/stats');$('health').textContent=JSON.stringify(stats,null,2);
+  const previous=$('app').value;$('app').replaceChildren(new Option('All apps',''));stats.top_apps.forEach(a=>$('app').add(new Option(a.label,a.label)));$('app').value=previous;
 }
-
-document.getElementById('filter-apply').addEventListener('click', () => {
-  currentPage = 0;
-  currentType = document.getElementById('filter-type').value;
-  currentApp = document.getElementById('filter-app').value;
-  loadTimeline();
-});
-
-document.getElementById('prev-page').addEventListener('click', () => {
-  if (currentPage > 0) { currentPage--; loadTimeline(); }
-});
-
-document.getElementById('next-page').addEventListener('click', () => {
-  currentPage++; loadTimeline();
-});
-
-// --- Search ---
-async function doSearch() {
-  const q = document.getElementById('search-input').value.trim();
-  if (!q) return;
-  const container = document.getElementById('search-results');
-  container.innerHTML = '<div class="empty">Searching…</div>';
-
-  const res = await fetch(`${API}/api/search?q=${encodeURIComponent(q)}&k=12`);
-  const data = await res.json();
-
-  if (!data.results || data.results.length === 0) {
-    container.innerHTML = '<div class="empty">No results found.</div>';
-    return;
-  }
-
-  const maxScore = Math.max(...data.results.map(r => r.score), 0.001);
-  container.innerHTML = data.results.map(r => `
-    <div class="search-result">
-      <div class="event-footer" style="margin-bottom:4px">
-        <span class="event-badge ${badgeClass(r.event_type)}">${r.event_type}</span>
-        <span>${escHtml(r.timestamp)}</span>
-        ${r.app ? `<span>${escHtml(r.app)}</span>` : ''}
-        <span style="margin-left:auto;color:var(--accent)">${(r.score * 100).toFixed(1)}%</span>
-      </div>
-      <div class="event-content">${escHtml(r.content)}</div>
-      <div class="score-bar"><div class="score-fill" style="width:${(r.score/maxScore*100).toFixed(1)}%"></div></div>
-    </div>`).join('');
-}
-
-document.getElementById('search-btn').addEventListener('click', doSearch);
-document.getElementById('search-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter') doSearch();
-});
-
-// --- Analytics ---
-function barChart(containerId, items, color) {
-  const el = document.getElementById(containerId);
-  if (!items || items.length === 0) { el.innerHTML = '<div class="empty">No data.</div>'; return; }
-  const max = Math.max(...items.map(i => i.count), 1);
-  el.innerHTML = items.map(({ label, count }) => `
-    <div class="bar-row">
-      <div class="bar-label" title="${escHtml(label)}">${escHtml(label)}</div>
-      <div class="bar-track"><div class="bar-fill" style="width:${(count/max*100).toFixed(1)}%;background:${color||'var(--accent)'}"></div></div>
-      <div class="bar-count">${count}</div>
-    </div>`).join('');
-}
-
-function hourChart(containerId, hours) {
-  const el = document.getElementById(containerId);
-  const max = Math.max(...hours.map(h => h.count), 1);
-  el.innerHTML = hours.map(({ hour, count }) => `
-    <div class="hour-bar">
-      <div class="hour-fill" style="height:${(count/max*100).toFixed(1)}%" title="${hour}:00 — ${count} events"></div>
-      <div class="hour-label">${hour}</div>
-    </div>`).join('');
-}
-
-async function loadAnalytics() {
-  const res = await fetch(`${API}/api/stats`);
-  const data = await res.json();
-
-  document.getElementById('stat-cards').innerHTML = `
-    <div class="stat-card"><div class="stat-value">${(data.total||0).toLocaleString()}</div><div class="stat-label">Total Events</div></div>
-    <div class="stat-card"><div class="stat-value">${(data.today||0).toLocaleString()}</div><div class="stat-label">Today</div></div>
-    <div class="stat-card"><div class="stat-value">${(data.this_week||0).toLocaleString()}</div><div class="stat-label">This Week</div></div>
-    <div class="stat-card"><div class="stat-value">${(data.unique_apps||0).toLocaleString()}</div><div class="stat-label">Unique Apps</div></div>`;
-
-  hourChart('chart-hour', data.by_hour || []);
-  barChart('chart-type', data.by_type, 'var(--accent)');
-  barChart('chart-app', data.top_apps, 'var(--green)');
-  barChart('chart-daily', (data.by_day || []).map(d => ({ label: d.date.slice(5), count: d.count })), 'var(--purple)');
-}
-
-// Init
-populateFilters();
-loadTimeline();
+async function refresh(){if(!token)return;$('unlock').hidden=true;$('workspace').hidden=false;await Promise.all([loadEvents(),loadProposals(),loadSettings()]);notice('Connected to your local service.');}
+$('login').addEventListener('submit',async e=>{e.preventDefault();token=$('token').value.trim();try{await refresh();sessionStorage.setItem('qareen-token',token);$('token').value='';}catch(err){notice(err.message);$('unlock').hidden=false;$('workspace').hidden=true;}});
+action($('lock'),async()=>{sessionStorage.removeItem('qareen-token');location.reload();});action($('refresh'),refresh);
+document.querySelectorAll('[data-panel]').forEach(b=>action(b,async()=>{document.querySelectorAll('.panel').forEach(p=>{p.hidden=p.id!==b.dataset.panel;});}));
+sources.forEach(s=>$('source').add(new Option(s,s)));action($('timeline-load'),()=>loadEvents());action($('more'),()=>loadEvents(true));
+async function ask(local){const q=$('query').value;const r=local?await api('/api/search?'+new URLSearchParams({q,source:$('source').value,app:$('app').value})):await api('/api/ask',{query:q,source:$('source').value,app:$('app').value});$('answer').textContent=r.answer||'';$('coverage').textContent=JSON.stringify(r.coverage);$('events').replaceChildren(...r.results.map(showEvent));$('more').hidden=true;}
+$('ask').addEventListener('submit',async e=>{e.preventDefault();try{await ask(false);}catch(err){notice(err.message);}});action($('search'),()=>ask(true));
+$('preferences').addEventListener('submit',async e=>{e.preventDefault();try{await api('/api/settings',{paused:$('paused').checked,auto_proposals:$('auto_proposals').checked,gmail_enabled:$('gmail_enabled').checked,retention_days:Number($('retention_days').value),daily_call_limit:Number($('daily_call_limit').value),timezone:$('timezone').value,gmail_label:$('gmail_label').value,preferences:JSON.parse($('writing').value),excluded_sources:sources.filter(s=>!$(`capture-${s}`).checked),cloud_sources:sources.filter(s=>$(`cloud-${s}`).checked)});notice('Settings saved.');await loadSettings();}catch(err){notice(err.message);}});
+action($('gmail-sync'),async()=>{await api('/api/gmail/sync',{});notice('Gmail sync completed.');await refresh();});
+action($('export'),async()=>{const r=await api('/api/export');const url=URL.createObjectURL(new Blob([JSON.stringify(r,null,2)],{type:'application/json'}));const a=el('a');a.href=url;a.download='qareen-events.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);});
+action($('delete-all'),async()=>{if(!confirm('Delete all local events, vectors, feedback and proposals? Gmail drafts already exported remain in Gmail. Pause the extension and clear its pending queue first.'))return;await api('/api/delete',{all:true});await refresh();notice('Local events and dependent data deleted.');});
+refresh().catch(e=>{notice(e.message);$('unlock').hidden=false;$('workspace').hidden=true;});

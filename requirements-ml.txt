@@ -1,0 +1,5 @@
+-r requirements.txt
+# Install the CPU torch wheel first; see scripts/install.sh.
+torch==2.9.1
+transformers==4.57.3
+sentence-transformers==5.1.2

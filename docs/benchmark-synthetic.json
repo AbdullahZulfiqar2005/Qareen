@@ -1,0 +1,16 @@
+{
+  "fixture": "synthetic exact-topic retrieval; hash demo vectors, not an LLM/semantic quality evaluation",
+  "python": "3.12.14",
+  "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+  "events": 10000,
+  "ingest_seconds": 10.118,
+  "events_per_second": 988.4,
+  "enrichment_seconds": 0.852,
+  "embedded_events": 1024,
+  "retrieval_cases": 20,
+  "hit_at_5": 1.0,
+  "retrieval_p50_ms": 22.3,
+  "retrieval_p95_ms": 32.05,
+  "peak_rss_mib": 21.0,
+  "sqlite_bytes": 6586368
+}

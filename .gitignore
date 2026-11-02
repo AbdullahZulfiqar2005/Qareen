@@ -32,3 +32,12 @@ qareen.xpi
 
 
 
+
+
+# Private runtime capabilities and migration locks
+*.token
+*.migration.lock
+.pytest_cache/
+.ruff_cache/
+
+node_modules/

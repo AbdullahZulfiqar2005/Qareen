@@ -1,34 +1,41 @@
-from langchain_community.document_loaders import BSHTMLLoader, DirectoryLoader
-from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from tqdm import tqdm
+"""Build an optional documentation index from operator-supplied local HTML files."""
 
-WIKI_PATH = "/usr/share/doc/arch-wiki/html/en"
+import argparse
+import os
+from pathlib import Path
 
-print("Loading files...")
-loader = DirectoryLoader(WIKI_PATH, glob="**/*.html", loader_cls=BSHTMLLoader)
-docs = loader.load()
+from qareen_core.config import data_dir
 
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-chunks = text_splitter.split_documents(docs)
-print(f"Total chunks: {len(chunks)}")
 
-# Batching add ki hai yahan
-print("Generating embeddings...")
-embedding_model = HuggingFaceEmbeddings(
-    model_name="all-MiniLM-L6-v2",
-    encode_kwargs={'batch_size': 64} # Yahan batch size increase kar diya
-)
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("directory", type=Path)
+    parser.add_argument("--output", type=Path, default=data_dir() / "arch_wiki_index")
+    args = parser.parse_args()
+    from bs4 import BeautifulSoup
+    from langchain_community.vectorstores import FAISS
+    from langchain_core.documents import Document
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Chunks ko batch mein process karo
-vector_store = None
-for i in tqdm(range(0, len(chunks), 100)): # 100 chunks ka batch
-    batch = chunks[i:i+100]
-    if vector_store is None:
-        vector_store = FAISS.from_documents(batch, embedding_model)
-    else:
-        vector_store.add_documents(batch)
+    from qareen_embeddings import RemoteEmbeddings
 
-vector_store.save_local("arch_wiki_index")
-print("Done!")
+    documents = []
+    for file in sorted(args.directory.rglob("*.html")):
+        soup = BeautifulSoup(file.read_text(errors="replace"), "html.parser")
+        for tag in soup(["script", "style", "nav"]):
+            tag.decompose()
+        documents.append(
+            Document(page_content=soup.get_text(" ", strip=True), metadata={"source": str(file)})
+        )
+    if not documents:
+        parser.error("No HTML files found")
+    splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=100)
+    os.umask(0o077)
+    index = FAISS.from_documents(splitter.split_documents(documents), RemoteEmbeddings())
+    args.output.mkdir(mode=0o700, parents=True, exist_ok=True)
+    index.save_local(str(args.output))
+    print(f"Indexed {len(documents)} files into {args.output}")
+
+
+if __name__ == "__main__":
+    main()

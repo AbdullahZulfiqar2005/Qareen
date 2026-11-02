@@ -1,0 +1,6 @@
+-r requirements-ml.txt
+langchain-core==1.2.5
+langchain-community==0.4.1
+langchain-text-splitters==1.1.0
+faiss-cpu==1.13.2
+beautifulsoup4==4.14.3

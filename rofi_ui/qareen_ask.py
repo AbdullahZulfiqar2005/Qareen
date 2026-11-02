@@ -1,24 +1,8 @@
 #!/usr/bin/env python3
+"""Rofi wrapper around the authenticated Qareen CLI. Preserves service error status.
+No cloud key is needed for local evidence retrieval. Questions are not auto-logged.
 """
-Backend for the Qareen rofi UI.
 
-Takes a single prompt as argv[1], shells out to the existing `qareen query`
-CLI (reusing its tested embedding-similarity + Arch Wiki + Groq pipeline
-instead of re-implementing it here), strips the ANSI colour codes and
-timeline preamble it prints, and prints just the final answer to stdout.
-
-Reusing `qareen query` also means every question you ask through the rofi
-UI is automatically logged back into ~/.qareen.db as a memory event (the Go
-binary already does this) - so the digital twin keeps getting richer every
-time you use it, without this script needing to duplicate that logic.
-
-Exit codes:
-  0  success, answer printed to stdout
-  1  usage error
-  2  qareen binary not found / daemon not reachable
-  3  GROQ_API_KEY missing
-  4  qareen query itself failed / timed out
-"""
 import os
 import re
 import shutil
@@ -43,7 +27,7 @@ def find_qareen_binary() -> str | None:
     local_bin = os.path.join(repo_root, "qareen")
     if os.path.isfile(local_bin) and os.access(local_bin, os.X_OK):
         return local_bin
-    
+
     # Fall back to PATH
     on_path = shutil.which("qareen")
     if on_path:
@@ -69,14 +53,6 @@ def main() -> int:
         return 2
 
     env = os.environ.copy()
-    if not env.get("GROQ_API_KEY"):
-        print(
-            "GROQ_API_KEY is not set.\n"
-            "Put it in ~/.config/qareen/.env as:\n"
-            '  GROQ_API_KEY="your-key-here"\n'
-            "Get a free key at https://console.groq.com/keys"
-        )
-        return 3
 
     try:
         result = subprocess.run(
@@ -97,7 +73,7 @@ def main() -> int:
     output = strip_ansi(result.stdout or "")
     stderr = strip_ansi(result.stderr or "")
 
-    if result.returncode != 0 and not output.strip():
+    if result.returncode != 0:
         print(stderr.strip() or "qareen query failed with no output.")
         return 4
 
